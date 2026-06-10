@@ -1,0 +1,14 @@
+{
+  "name": "@fhe-brain/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "pg": "^8.13.0",
+    "bullmq": "^5.30.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.5.0"
+  }
+}

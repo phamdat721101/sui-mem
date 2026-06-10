@@ -1,0 +1,30 @@
+{
+  "name": "@openx/mcp",
+  "version": "1.0.0",
+  "description": "OpenX MCP stdio shim — Claude Desktop / Cursor / Bedrock AgentCore subprocess transport. HTTP transport at api.openx.so/mcp also works without this package.",
+  "main": "dist/bin.js",
+  "bin": {
+    "openx-mcp": "dist/bin.js"
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@fhe-ai-context/sdk": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/phamdat721701/privacy-context",
+  "keywords": ["mcp", "openx", "agent-memory", "walrus", "sui", "x402"]
+}

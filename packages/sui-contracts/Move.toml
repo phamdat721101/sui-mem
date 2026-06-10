@@ -1,0 +1,7 @@
+[package]
+name = "fhe_brain"
+edition = "2024.beta"
+version = "0.1.0"
+
+[addresses]
+fhe_brain = "0x0"

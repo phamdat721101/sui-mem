@@ -1,0 +1,34 @@
+{
+  "name": "openx-sui-memory",
+  "private": true,
+  "workspaces": [
+    "packages/api",
+    "packages/frontend",
+    "packages/openx-mcp",
+    "packages/runtime-utils",
+    "packages/sdk",
+    "packages/shared",
+    "packages/sui-sdk",
+    "packages/ui"
+  ],
+  "scripts": {
+    "runtime-utils:build": "npm run build -w packages/runtime-utils",
+    "sdk:build": "npm run build -w packages/sdk",
+    "ui:build": "npm run build -w packages/ui",
+    "sui-sdk:build": "npm run build -w packages/sui-sdk",
+    "openx-mcp:build": "npm run build -w packages/openx-mcp",
+    "api:dev": "npm run dev -w packages/api",
+    "api:build": "npm run build -w packages/api",
+    "api:start": "npm run start -w packages/api",
+    "frontend:dev": "npm run dev -w packages/frontend",
+    "frontend:build": "npm run build -w packages/frontend",
+    "frontend:start": "npm run start -w packages/frontend",
+    "build": "npm run runtime-utils:build && npm run sdk:build && npm run ui:build && npm run sui-sdk:build && npm run openx-mcp:build && npm run api:build",
+    "dev": "./scripts/start-dev.sh",
+    "smoke:walrus": "tsx scripts/smoke-walrus.ts",
+    "smoke:sui-flow": "tsx scripts/smoke-sui-flow.ts",
+    "smoke:memwal-adapter": "tsx scripts/smoke-memwal-adapter.ts",
+    "smoke:cognitive-namespaces": "tsx scripts/smoke-cognitive-namespaces.ts",
+    "db:migrate": "bash -c 'for f in packages/shared/migrations/*.sql; do psql \"$DATABASE_URL\" -f \"$f\" || true; done'"
+  }
+}

@@ -1,0 +1,47 @@
+name: regression
+
+# Phase A→B gate (G5 isolation guarantee).
+# Sui-upgrade pivot must NOT break Standard tier or non-Sui rails.
+
+on:
+  pull_request:
+    paths:
+      - 'packages/sdk/**'
+      - 'packages/api/**'
+      - 'packages/sui-sdk/**'
+      - 'packages/sui-contracts/**'
+      - 'packages/contracts/**'
+      - 'packages/shared/migrations/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/regression.yml'
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install (no audit)
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Sui CLI (best effort)
+        # Move tests skip cleanly if sui isn't on PATH (logged as warning).
+        run: |
+          if ! command -v sui >/dev/null; then
+            echo "sui CLI not pre-installed; Move tests will be skipped in this CI shard"
+          fi
+
+      - name: Run regression suite
+        run: bash scripts/run-all-smokes.sh

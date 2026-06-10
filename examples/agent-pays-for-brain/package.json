@@ -1,0 +1,15 @@
+{
+  "name": "@fhe-ai-context/example-agent-pays",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Showcase: an AI agent identifies via ERC-8004, subscribes to a Sui brain, queries it, gets a Phala-attested answer, and migrates the brain across chains.",
+  "type": "commonjs",
+  "scripts": {
+    "demo": "node agent.js"
+  },
+  "dependencies": {
+    "@fhe-ai-context/sdk": "*",
+    "@fhe-ai-context/sui-sdk": "*",
+    "@fhe-ai-context/runtime-utils": "*"
+  }
+}

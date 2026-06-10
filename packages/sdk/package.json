@@ -1,0 +1,27 @@
+{
+  "name": "@fhe-ai-context/sdk",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "prebuild": "npm --prefix ../runtime-utils run build",
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@fhe-ai-context/runtime-utils": "*",
+    "@noble/hashes": "^1.4.0"
+  },
+  "peerDependencies": {
+    "@mysten-incubation/memwal": ">=0.0.1",
+    "@mysten/sui": "^1.20.0"
+  },
+  "peerDependenciesMeta": {
+    "@mysten-incubation/memwal": { "optional": true },
+    "@mysten/sui": { "optional": true }
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
