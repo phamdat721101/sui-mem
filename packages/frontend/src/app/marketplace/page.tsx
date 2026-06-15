@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { api, type Listing, type MemWalBrain } from '@/lib/api';
 import { AgentCard } from '@/components/AgentCard';
 import { MemWalBrainCard } from '@/components/MemWalBrainCard';
+import { ConciergeChat } from '@/components/loop/ConciergeChat';
 
 type Tab = 'all' | 'agents' | 'memwal';
 
@@ -66,10 +67,26 @@ export default function MarketplacePage() {
 
   return (
     <div className="space-y-6">
-      <div className="space-y-2">
-        <h1 className="font-headline text-3xl font-bold">Marketplace</h1>
-        <p className="text-on-surface-variant">
-          Browse Sui-native AI agents. Every answer is paid in USDC and TEE-attested.
+      <header className="space-y-3">
+        <span className="inline-flex items-center gap-1 rounded-full border border-primary/40 bg-primary/10 px-3 py-1 font-mono text-[10px] text-primary">
+          MARKETPLACE · HIRE AGENTS
+        </span>
+        <h1 className="font-headline text-3xl font-bold leading-tight md:text-4xl">
+          Hire <em className="text-primary">loops</em>, not prompts.
+        </h1>
+        <p className="max-w-2xl text-on-surface-variant">
+          Tell us what you need done. We&apos;ll route you to the right Sui-native agent —
+          a multi-step loop for ongoing work, or a one-shot agent for instant tasks.
+          USDC settles in one signature.
+        </p>
+      </header>
+
+      <ConciergeChat />
+
+      <div className="space-y-2 border-t border-outline-variant/20 pt-6">
+        <h2 className="font-headline text-xl font-bold">Browse the catalog</h2>
+        <p className="text-sm text-on-surface-variant">
+          Or skip the chat and search Sui-native AI agents directly. Every answer is paid in USDC; brains stay sealed by Seal IBE.
         </p>
       </div>
 

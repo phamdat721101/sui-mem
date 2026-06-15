@@ -185,13 +185,14 @@ router.post('/remember', requireSuiWallet, async (req: AuthRequest, res) => {
     return res.status(400).json({ error: 'text required' });
   }
   const accountId = await resolveAccountId(wallet);
-  if (!accountId) {
+  if (!accountId && process.env.MEMWAL_FALLBACK_MODE !== 'mock') {
     return res.status(409).json({
       error: 'memwal_account_not_provisioned',
       message: 'Provision your MemWalAccount first (POST /v3/memory/account/provision).',
     });
   }
   try {
+    if (!accountId) throw new Error('memwal_account_not_provisioned');
     const adapter = await getMemWalAdapter(wallet, accountId);
     const out = await adapter.remember(text, namespace);
     res.json({ ok: true, blob_id: out.blob_id ?? null, job_id: out.job_id ?? null });
@@ -500,17 +501,29 @@ router.get('/marketplace', async (req, res) => {
     params.push(`%${q}%`);
     where.push(`(title ILIKE $${params.length} OR description ILIKE $${params.length})`);
   }
-  const r = await pool.query(
-    `SELECT sui_object_id, seller_wallet, memwal_account_id, namespace, title, description,
-            price_per_query_usdc, kya_required, attestation_required, cognitive_level,
-            sovereignty_proof_url, created_at
-     FROM memwal_marketplace_brains
-     WHERE ${where.join(' AND ')}
-     ORDER BY created_at DESC
-     LIMIT 100`,
-    params,
-  );
-  res.json({ brains: r.rows });
+  // Defense in depth: any DB-level failure (missing table, transient network)
+  // returns an empty catalog instead of crashing the process via an
+  // unhandled rejection. This is the surface that browser tabs hit on every
+  // /marketplace render — the cost of a blow-up here is everyone seeing 502s.
+  try {
+    const r = await pool.query(
+      `SELECT sui_object_id, seller_wallet, memwal_account_id, namespace, title, description,
+              price_per_query_usdc, kya_required, attestation_required, cognitive_level,
+              sovereignty_proof_url, created_at
+       FROM memwal_marketplace_brains
+       WHERE ${where.join(' AND ')}
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      params,
+    );
+    res.json({ brains: r.rows });
+  } catch (e) {
+    logger.warn(
+      { err: (e as Error).message, code: (e as { code?: string }).code },
+      'memwal:marketplace:db_fallback',
+    );
+    res.json({ brains: [] });
+  }
 });
 
 /**

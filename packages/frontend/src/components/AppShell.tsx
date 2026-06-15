@@ -27,7 +27,6 @@ const NAV_ITEMS: NavItem[] = [
   { href: '/', icon: 'home', label: 'Home' },
   { href: '/marketplace', icon: 'storefront', label: 'Marketplace' },
   { href: '/studio', icon: 'science', label: 'Studio', requiresWallet: true },
-  { href: '/train', icon: 'school', label: 'Train', requiresWallet: true },
   { href: '/settings', icon: 'tune', label: 'Settings', requiresWallet: true },
 ];
 

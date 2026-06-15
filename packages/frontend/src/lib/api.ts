@@ -127,20 +127,109 @@ export interface PublishResult {
   manifest_yaml: string;
 }
 
+export interface TrainingEvent {
+  event_type: 'upload' | 'remember' | 'reflect' | 'settle';
+  walrus_blob_id: string | null;
+  sui_tx_digest: string | null;
+  namespace: string | null;
+  summary: string | null;
+  created_at: string;
+  explorer_urls: { walrus: string | null; sui: string | null };
+}
+
 export const api = {
   listings: () =>
     getJson<{ listings: Listing[] }>('/v3/marketplace/listings').then((r) => r.listings),
   memwalBrains: () =>
     getJson<{ brains: MemWalBrain[] }>('/v3/memory/marketplace').then((r) => r.brains),
   listing: async (slugOrId: string): Promise<Listing | null> => {
-    const all = await getJson<{ listings: Listing[] }>('/v3/marketplace/listings').then(
-      (r) => r.listings,
+    // Single-slug endpoint avoids the "fetch all + find" anti-pattern that
+    // turned every transient API blip into a false "agent not found".
+    // 404 = real not-found (return null). Other failures throw so the UI
+    // can render a retry button instead of misleading the user.
+    const r = await fetch(
+      `${AGENT_BACKEND_URL}/v3/marketplace/listings/${encodeURIComponent(slugOrId)}`,
+      { headers: { 'Content-Type': 'application/json' }, cache: 'no-store' },
     );
-    return (
-      all.find((l) => l.slug === slugOrId || String(l.brain_id) === slugOrId || l.id === slugOrId) ??
-      null
-    );
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    const j = (await r.json()) as { listing: Listing };
+    return j.listing;
   },
+
+  // ─── Agent workspace (PRD-E port) ─────────────────────────────────────
+  /**
+   * Mint a Walrus publisher URL + size cap. Step 1 of the upload flow.
+   * The browser then PUTs the file bytes directly to the publisher
+   * (no proxy through the API).
+   */
+  mintAgentUpload: (slug: string, file: { original_name: string; mime_type: string; size_bytes: number }) =>
+    getJson<{ publisher_url: string; aggregator_url: string; max_bytes: number; ttl_sec: number }>(
+      `/v3/agents/${encodeURIComponent(slug)}/uploads/mint`,
+      { method: 'POST', body: JSON.stringify(file) },
+    ),
+
+  /**
+   * Step 2: PUT raw bytes to the Walrus publisher. Returns the blobId.
+   * This lives client-side; bytes never traverse the OpenX API.
+   */
+  uploadFileToWalrus: async (publisherUrl: string, file: File): Promise<string> => {
+    const res = await fetch(`${publisherUrl}/v1/blobs?epochs=1`, { method: 'PUT', body: file });
+    if (!res.ok) throw new Error(`walrus publisher ${res.status}`);
+    const j = (await res.json()) as {
+      newlyCreated?: { blobObject?: { blobId?: string } };
+      alreadyCertified?: { blobId?: string };
+    };
+    const blobId = j.newlyCreated?.blobObject?.blobId ?? j.alreadyCertified?.blobId;
+    if (!blobId) throw new Error('walrus publisher returned no blobId');
+    return blobId;
+  },
+
+  /**
+   * Step 3: record the blob_id with the API so the server can attach the
+   * upload to a future /try call. PDF rows are extracted synchronously
+   * here — the response includes `extraction_status` so the UI can show
+   * "PDF parsed" / "PDF is image-only — referenced by URL only" etc.
+   */
+  confirmAgentUpload: (slug: string, body: {
+    blob_id: string; original_name: string; mime_type: string; size_bytes: number;
+    payer_address?: string;
+  }) =>
+    getJson<{ upload_id: string; expires_at: string; extraction_status: string }>(
+      `/v3/agents/${encodeURIComponent(slug)}/uploads`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+
+  /** Free `/try` — no payment_coin_object_id; rate-limited 5/day per IP. */
+  tryAgentFree: (slug: string, body: { question: string; upload_ids?: string[] }) =>
+    getJson<{
+      answer: string;
+      citations: Array<{ source?: string; snippet: string }>;
+      attestation: { provider: string; quote: string; verified: boolean; issuedAt: string };
+      settled: null;
+    }>(`/v3/agents/${encodeURIComponent(slug)}/try`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Anonymized public ledger for the recent-calls feed. */
+  getAgentRecentCalls: (slug: string, limit = 10) =>
+    getJson<{
+      rows: Array<{
+        tx_hash: string; payer: string; amount_usdc: string;
+        method: string; network: string; settled_at: string;
+      }>;
+      cached: boolean;
+    }>(`/v3/agents/${encodeURIComponent(slug)}/recent-calls?limit=${limit}`),
+
+  /** AgentCard for AI-buyer integration (the same JSON Cursor / Claude reads). */
+  getAgentCard: (slug: string) =>
+    getJson<{
+      name: string; description: string; url: string; payTo: string; chain: string;
+      asset: string | null;
+      tools: Array<{ name: string; description: string; price: string; currency: 'USDC' }>;
+      system_prompt: string | null;
+    }>(`/api/v1/${encodeURIComponent(slug)}/.well-known/agent.json`),
 
   // ─── Seller surface ────────────────────────────────────────────────────
   sellerMe: (wallet: string) =>
@@ -159,6 +248,33 @@ export const api = {
       chain: 'sui-testnet',
       ...input,
     }),
+
+  // ─── Per-agent training (PRD-F) ────────────────────────────────────────
+  getAgentTrainingEvents: (wallet: string, slug: string, limit = 50) =>
+    fetch(
+      `${AGENT_BACKEND_URL}/v3/marketplace/seller/agents/${encodeURIComponent(slug)}/events?limit=${limit}`,
+      { headers: { 'x-wallet-address': wallet }, cache: 'no-store' },
+    ).then(async (r) => {
+      if (r.status === 404) return { events: [] as TrainingEvent[], notOwner: true };
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      const j = (await r.json()) as { events: TrainingEvent[] };
+      return { events: j.events, notOwner: false };
+    }),
+  sellerAgentUploadConfirm: (wallet: string, slug: string, body: {
+    walrus_blob_id: string; original_name: string; mime_type: string; size_bytes: number;
+  }) =>
+    authedJson<{ id: string; created_at: string }>(
+      'POST', `/v3/marketplace/seller/agents/${encodeURIComponent(slug)}/upload`, wallet, body,
+    ),
+  sellerAgentRemember: (wallet: string, slug: string, text: string, level: 2 | 3 | 4 = 3) =>
+    authedJson<{ id: string; walrus_blob_id: string | null; namespace: string; mode: string | null; created_at: string }>(
+      'POST', `/v3/marketplace/seller/agents/${encodeURIComponent(slug)}/remember`, wallet,
+      { text, level },
+    ),
+  sellerAgentTrainingLoop: (wallet: string, slug: string) =>
+    authedJson<{ id: string; walrus_blob_id: string | null; namespace: string; critique: string; created_at: string }>(
+      'POST', `/v3/marketplace/seller/agents/${encodeURIComponent(slug)}/training-loop`, wallet, {},
+    ),
 
   // ─── MemWal training surface ──────────────────────────────────────────
   memwalAccount: (wallet: string) =>

@@ -56,12 +56,6 @@ function Studio({ wallet }: { wallet: string }) {
         </div>
         <div className="flex items-center gap-2">
           <Link
-            href="/train"
-            className="inline-flex items-center gap-1 rounded-full border border-outline-variant/40 px-4 py-2 text-sm hover:border-primary/40 hover:text-primary"
-          >
-            <span className="material-symbols-outlined text-[16px]">school</span> Train
-          </Link>
-          <Link
             href="/studio/publish"
             className="inline-flex items-center gap-1 rounded-full bg-primary px-4 py-2 text-sm font-medium text-on-primary hover:opacity-90"
           >
@@ -104,9 +98,14 @@ function Studio({ wallet }: { wallet: string }) {
                   <span className="text-on-surface-variant">
                     {a.calls_total} calls · earned ${Number(a.earned_total).toFixed(4)}
                   </span>
-                  <Link href={`/agent/${a.slug}`} className="font-mono text-[11px] text-primary">
-                    view ↗
-                  </Link>
+                  <div className="flex items-center gap-3">
+                    <Link href={`/studio/agent/${a.slug}/train`} className="font-mono text-[11px] text-secondary hover:underline">
+                      train ↗
+                    </Link>
+                    <Link href={`/agent/${a.slug}`} className="font-mono text-[11px] text-primary">
+                      view ↗
+                    </Link>
+                  </div>
                 </div>
               </li>
             ))}

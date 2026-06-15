@@ -33,6 +33,13 @@ dev-dist/
 .bun/
 bun.lockb
 .deno/
+.svelte-kit/
+.astro/
+.nuxt/
+.tanstack/
+.nx/
+.rspack/
+.rsbuild/
 
 # Edge / serverless deploy state
 .serverless/
@@ -53,7 +60,13 @@ cypress/videos/
 *.sqlite
 *.sqlite3
 *.sql.dump
+*.sql.gz
+*.dump
 dump.sql
+pgdata/
+pg_data/
+postgres-data/
+.pg/
 
 # TypeScript
 *.tsbuildinfo
@@ -144,6 +157,28 @@ service-account*.json
 .envrc
 .env.vault
 
+# Explicit credential filename patterns — defense against typos that
+# bypass the .env-only filters (e.g. someone saves a Bedrock key as
+# `bedrock-prod-key.txt`). Match common ways credentials end up named.
+*-credentials.json
+*-credentials.txt
+*-credentials.yaml
+*-credentials.yml
+*.creds
+*-secret.json
+*-secret.txt
+*-secret.yaml
+*-secrets.json
+*-secrets.yaml
+bedrock*key*
+*bedrock*api*key*
+*api-key*.json
+*api-key*.txt
+*aws*credentials*
+*aws*secret*
+*openai*key*
+*anthropic*key*
+
 # Generic auth / token blobs
 *.token
 auth.json
@@ -157,6 +192,11 @@ keystore/
 *.mnemonic
 *.seed
 .sui/
+sui.keystore
+sui.aliases
+sui_config/
+*.suikey
+*.suiwallet
 
 # Generic credential containers
 secrets/
@@ -169,6 +209,16 @@ private/
 deployments/
 .deploy/
 .deployment
+
+# Local Docker / Compose overrides — by convention these carry env-injected
+# secrets that don't belong in CI. The base compose / Dockerfile stay tracked.
+docker-compose.override.yml
+docker-compose.override.yaml
+docker-compose.local.yml
+compose.override.yml
+compose.override.yaml
+compose.local.yml
+.docker/
 
 # =============================================================================
 # Logs & runtime
@@ -219,6 +269,14 @@ Desktop.ini
 .aider*
 .codeium*
 .copilot/
+.kiro/
+.gemini/
+.openhands/
+.zed-ai/
+.devin/
+.cody/
+.tabnine/
+.gptcommit*
 
 # =============================================================================
 # Design assets (large, reference-only)
@@ -247,5 +305,8 @@ packages/*/pnpm-lock.yaml
 *.tar
 *.zip.tmp
 *.bak
+*.bak.*
 *.tmp
 *~
+.#*
+\#*\#

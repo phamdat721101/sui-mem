@@ -80,6 +80,15 @@ step "seed-tri-marketplace DRY validation"
 npm run seed:tri-marketplace > /tmp/seed.log 2>&1 || fail "seed dry-run"
 ok "bootstrap content + cost math valid"
 
+# ─── 4b. Agent workspace E2E (requires running API) ───────────────────────
+if [ -n "${OPENX_API_URL:-}" ]; then
+  step "Agent workspace E2E (PRD-E port — needs running API)"
+  npm run smoke:agent-workspace-e2e > /tmp/smoke_agent_ws.log 2>&1 || fail "agent-workspace-e2e smoke"
+  ok "$(grep '✅' /tmp/smoke_agent_ws.log | tail -1)"
+else
+  printf "${color_yellow}⚠  OPENX_API_URL not set — skipping smoke:agent-workspace-e2e${color_reset}\n"
+fi
+
 # ─── 5. Existing-smoke registry (informational only) ──────────────────────
 step "Existing smokes (run locally with credentials):"
 cat <<EOF

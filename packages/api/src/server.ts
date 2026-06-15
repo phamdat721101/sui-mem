@@ -19,6 +19,9 @@ import cors from 'cors';
 import { auth } from './middleware/auth';
 import v3MemoryRouter from './routes/v3-memory';
 import v3MarketplaceRouter from './routes/v3-marketplace';
+import v3LoopRouter from './routes/v3-loop';
+import v3AgentsRouter from './routes/v3-agents';
+import v1PublicRouter from './routes/v1Public';
 import mcpRouter from './routes/mcp';
 import {
   logger,
@@ -63,11 +66,24 @@ app.use(express.json({ limit: '2mb' }));
 app.get('/health', healthHandler);
 app.get('/metrics', metricsHandler);
 
+// /api/v1/<slug> — public AI-buyer paywall (the paywall IS the auth).
+// Mounted BEFORE the global `auth` middleware so /api/v1/* never sees it.
+app.use('/api/v1', v1PublicRouter);
+
 // /v3/memory — Sui-native MemWal product (the heart of OpenX).
 app.use('/v3/memory', auth, v3MemoryRouter);
 
 // /v3/marketplace — public catalog + seller publish.
 app.use('/v3/marketplace', auth, v3MarketplaceRouter);
+
+// /v3/agents — buyer workspace endpoints. Public surface (no auth needed —
+// the agent paywall middleware gates the paid /try path; free /try uses
+// per-IP rate limits).
+app.use('/v3/agents', v3AgentsRouter);
+
+// /v3/loop — Sui-native loop marketplace (Mode A x402 fast lane + Mode B
+// loop hire). Auth allows public reads via PUBLIC_PATHS in middleware/auth.ts.
+app.use('/v3/loop', auth, v3LoopRouter);
 
 // /mcp — MCP JSON-RPC 2.0 gateway. Public; the -32402 envelope on paid
 // tools is the paywall.

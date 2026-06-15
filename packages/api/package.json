@@ -11,11 +11,13 @@
   "dependencies": {
     "@fhe-ai-context/runtime-utils": "*",
     "@fhe-ai-context/sdk": "*",
+    "@fhe-ai-context/sui-sdk": "*",
     "@mysten/sui": "^1.20.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "n-payment": "^0.8.0",
+    "pdfjs-dist": "4.0.379",
     "pg": "^8.11.3",
     "pino": "^9.14.0",
     "pino-http": "^10.5.0",

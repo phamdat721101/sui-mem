@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { AGENT_BACKEND_URL, api, priceFromPricing, type Listing, type MemWalBrain } from '@/lib/api';
+import { AgentRecentCalls } from '@/components/AgentRecentCalls';
 
 /**
  * /agent/[id] — paid agent detail.
@@ -28,22 +29,51 @@ export default function AgentDetailPage() {
   const [listing, setListing] = useState<Listing | null>(null);
   const [brain, setBrain] = useState<MemWalBrain | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   useEffect(() => {
     if (!id) return;
+    let cancelled = false;
     setLoading(true);
-    if (isMemwal) {
-      api.memwalBrains()
-        .then((arr) => setBrain(arr.find((b) => b.sui_object_id === id) ?? null))
-        .finally(() => setLoading(false));
-    } else {
-      api.listing(id)
-        .then(setListing)
-        .finally(() => setLoading(false));
-    }
-  }, [id, isMemwal]);
+    setError(null);
+    const promise = isMemwal
+      ? api.memwalBrains().then((arr) => {
+          if (!cancelled) setBrain(arr.find((b) => b.sui_object_id === id) ?? null);
+        })
+      : api.listing(id).then((l) => {
+          if (!cancelled) setListing(l);
+        });
+    promise
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, isMemwal, retryNonce]);
 
   if (loading) return <div className="py-20 text-center text-on-surface-variant">Loading…</div>;
+  if (error) {
+    return (
+      <div className="py-20 text-center">
+        <p className="text-on-surface-variant">Couldn&apos;t load this agent ({error}).</p>
+        <button
+          type="button"
+          onClick={() => setRetryNonce((n) => n + 1)}
+          className="mt-3 inline-block rounded-full bg-primary px-4 py-1.5 text-sm font-medium text-on-primary hover:opacity-90"
+        >
+          Retry
+        </button>
+        <Link href="/marketplace" className="ml-3 inline-block text-sm text-on-surface-variant hover:text-primary">
+          ← Back to marketplace
+        </Link>
+      </div>
+    );
+  }
   if (!listing && !brain) {
     return (
       <div className="py-20 text-center">
@@ -150,7 +180,23 @@ function ListingDetail({ listing }: { listing: Listing }) {
             <Row label="endpoint" value={`/api/v1/${listing.slug}`} mono />
             <Row label="published" value={new Date(listing.created_at).toLocaleDateString()} />
           </div>
+          <Link
+            href={`/agent/${listing.slug}/run`}
+            className="flex w-full items-center justify-center gap-2 rounded-full bg-primary py-2 font-mono text-[11px] uppercase tracking-wider text-on-primary hover:opacity-90"
+          >
+            <span className="material-symbols-outlined text-[14px]">play_arrow</span>
+            Run a task
+          </Link>
+          <Link
+            href={`/agent/${listing.slug}/integrate`}
+            className="block w-full rounded-full border border-outline-variant/40 py-2 text-center font-mono text-[10px] uppercase tracking-wider hover:border-primary/40 hover:text-primary"
+          >
+            For AI integrators →
+          </Link>
           <CopyButton value={curl} label="Copy curl" full />
+        </div>
+        <div className="mt-4">
+          <AgentRecentCalls slug={listing.slug} limit={6} />
         </div>
       </aside>
     </div>
@@ -181,7 +227,7 @@ function MemWalDetail({ brain }: { brain: MemWalBrain }) {
             { label: `L${brain.cognitive_level}`, tone: 'matrix', icon: 'memory' },
             { label: 'Sui · Walrus · MemWal', tone: 'secondary', icon: 'hub' },
             ...(brain.attestation_required > 0
-              ? [{ label: 'TEE-attested', tone: 'secondary' as const, icon: 'shield' }]
+              ? [{ label: 'Seal-attested', tone: 'secondary' as const, icon: 'shield' }]
               : []),
           ]}
           subtitle={`Seller ${brain.seller_wallet.slice(0, 8)}…${brain.seller_wallet.slice(-4)}`}
@@ -196,7 +242,7 @@ function MemWalDetail({ brain }: { brain: MemWalBrain }) {
           <p className="text-xs text-on-surface-variant">
             First call returns <code>402 Payment Required</code> with a Sui-USDC challenge. Pay via the
             programmable transaction <code className="font-mono">subscription_policy::subscribe</code>, then retry with the receipt.
-            The response carries the recall hits + a three-proof attestation bundle (Phala TEE quote + Sui billing tx + Walrus blob ids).
+            The response carries the recall hits + a privacy-receipt bundle (Seal IBE key derivation proof + Sui billing tx + Walrus blob ids).
           </p>
         </Card>
 

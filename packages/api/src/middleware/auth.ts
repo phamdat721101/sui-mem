@@ -25,6 +25,7 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/agents\/top$/,
   /^\/agents\/search$/,
   /^(?:\/marketplace)?\/listings$/,
+  /^(?:\/marketplace)?\/listings\/[^/]+$/,
   /^(?:\/marketplace)?\/workflows$/,
   /^(?:\/marketplace)?\/workflows\/[^/]+$/,
   /^(?:\/marketplace)?\/workflows\/[^/]+\/recent$/,
@@ -36,6 +37,10 @@ const PUBLIC_PATHS: RegExp[] = [
   /^(?:\/memory)?\/marketplace$/,
   /^(?:\/memory)?\/brain\/[^/]+\/?$/,
   /^(?:\/memory)?\/brain\/[^/]+\/sovereignty-proof$/,
+  // OpenX Loops public surface (mounted under /v3/loop).
+  /^\/agents\/[^/]+$/,
+  /^\/jobs\/[^/]+$/,
+  /^\/concierge\/search$/,
 ];
 
 export const auth = (req: AuthRequest, res: Response, next: NextFunction) => {

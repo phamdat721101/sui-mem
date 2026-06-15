@@ -6,7 +6,7 @@ import { AppShell } from '@/components/AppShell';
 export const metadata: Metadata = {
   title: 'OpenX — Sui-native AI agent memory marketplace',
   description:
-    'Agents pay USDC to query your brain. Memory + payment + privacy on one chain — Sui (Walrus + Seal + MemWal + Phala TEE).',
+    'Agents pay USDC to query your brain. Memory + payment + privacy on one chain — Sui (Walrus + Seal + MemWal + Bedrock).',
 };
 
 export const viewport: Viewport = {

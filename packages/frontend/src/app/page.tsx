@@ -2,9 +2,8 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
-import { api, type Listing, type MemWalBrain } from '@/lib/api';
+import { api, type Listing } from '@/lib/api';
 import { AgentCard } from '@/components/AgentCard';
-import { MemWalBrainCard } from '@/components/MemWalBrainCard';
 
 /**
  * Home — AI-Discovery layout.
@@ -22,16 +21,12 @@ import { MemWalBrainCard } from '@/components/MemWalBrainCard';
 
 export default function HomePage() {
   const [listings, setListings] = useState<Listing[] | null>(null);
-  const [memwal, setMemwal] = useState<MemWalBrain[]>([]);
   const [topErr, setTopErr] = useState<string | null>(null);
   const [demand, setDemand] = useState('');
 
   useEffect(() => {
-    Promise.all([api.listings().catch(() => []), api.memwalBrains().catch(() => [])])
-      .then(([ls, mw]) => {
-        setListings(ls);
-        setMemwal(mw);
-      })
+    api.listings()
+      .then((ls) => setListings(ls))
       .catch((e: Error) => setTopErr(e.message));
   }, []);
 
@@ -63,7 +58,7 @@ export default function HomePage() {
       {filtered ? (
         <ResultsGrid listings={filtered} demand={demand} onClear={() => setDemand('')} />
       ) : (
-        <HighlightsGrid listings={listings} memwal={memwal} err={topErr} />
+        <HighlightsGrid listings={listings} err={topErr} />
       )}
       <Footer />
     </div>
@@ -76,7 +71,7 @@ function SummarySection() {
   return (
     <section className="mx-auto mt-4 flex max-w-4xl flex-col items-center gap-7 text-center md:mt-8 md:gap-9">
       <span className="matrix-chip rounded border border-secondary/20 px-2 py-1 font-mono text-[11px] uppercase tracking-wider">
-        Sui · Walrus · Seal · Phala TEE — three proofs, one chain
+        Sui · Walrus · Seal · Bedrock — three proofs, one chain
       </span>
       <h1 className="font-headline text-4xl font-bold leading-tight tracking-tight md:text-6xl">
         The AI agent marketplace with{' '}
@@ -178,11 +173,9 @@ function ChatBox({ demand, setDemand }: { demand: string; setDemand: (v: string)
 
 function HighlightsGrid({
   listings,
-  memwal,
   err,
 }: {
   listings: Listing[] | null;
-  memwal: MemWalBrain[];
   err: string | null;
 }) {
   if (listings === null && !err) {
@@ -203,34 +196,6 @@ function HighlightsGrid({
   }
   return (
     <>
-      <section aria-labelledby="memwal-h" className="space-y-4">
-        <div className="flex items-end justify-between gap-2 border-b border-white/5 pb-3">
-          <div>
-            <h2 id="memwal-h" className="font-headline text-2xl font-bold">Cognitive brains</h2>
-            <p className="text-sm text-on-surface-variant">
-              Pay-per-query Walrus + MemWal brains. Three-proof attestation on every recall.
-            </p>
-          </div>
-          <Link
-            href="/marketplace?type=memwal"
-            className="inline-flex shrink-0 items-center gap-1 font-mono text-[11px] uppercase text-primary hover:underline"
-          >
-            View all <span className="material-symbols-outlined text-[14px]" aria-hidden>arrow_forward</span>
-          </Link>
-        </div>
-        {memwal.length === 0 ? (
-          <p className="rounded-xl border border-dashed border-outline-variant/40 bg-surface-container-low p-6 text-center text-sm text-on-surface-variant">
-            No cognitive brains published yet. Use the MCP tool <code className="font-mono">openx_memwal_publish</code> to be first.
-          </p>
-        ) : (
-          <ul role="list" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {memwal.slice(0, 6).map((b) => (
-              <li key={b.sui_object_id}><MemWalBrainCard brain={b} /></li>
-            ))}
-          </ul>
-        )}
-      </section>
-
       <section aria-labelledby="agents-h" className="space-y-4">
         <div className="flex items-end justify-between gap-2 border-b border-white/5 pb-3">
           <div>
@@ -303,7 +268,7 @@ function ResultsGrid({ listings, demand, onClear }: { listings: Listing[]; deman
 function Footer() {
   return (
     <footer className="border-t border-outline-variant/30 pt-6 text-xs text-on-surface-variant">
-      Sui · Walrus · Seal · Phala TEE — three proofs, one chain.
+      Sui · Walrus · Seal · Bedrock — three proofs, one chain.
     </footer>
   );
 }

@@ -55,3 +55,9 @@ export * from './payment/payRouter';
 // MCP server + tool registry.
 export * from './mcp/server';
 export * from './mcp/tools';
+
+// OpenX Loops — Sui-native loop marketplace SDK surface (Mode A + Mode B).
+export * from './loop/clientCrypto';
+export * from './loop/sellerPublish';
+export * from './loop/x402Settle';
+export * from './loop/loopHire';
