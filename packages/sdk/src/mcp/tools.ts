@@ -66,7 +66,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'memwal_marketplace_query',
     description:
-      'Paid recall against a published MemWal brain. Returns recall results + three-proof attestation (Phala/Sui/Walrus).',
+      'Paid recall against a published MemWal brain. Returns recall results + three-proof attestation (Phala/Sui/Walrus). PAYMENT: this tool requires the host to have a Sui wallet (set OPENX_WALLET_ADDRESS) with USDC balance. The server returns JSON-RPC error -32402 with a `data.payment` envelope (rail, amount_usdc, pay_to, endpoint). The host signs a Sui PTB transferring `amount_usdc` of USDC to `pay_to`, then retries with header `x-payment: <tx_digest>`. The OpenX MCP server can do this automatically when OPENX_WALLET_PRIVATE_KEY is configured; otherwise the host must complete the dance.',
     paid: true,
     inputSchema: {
       type: 'object',
@@ -158,6 +158,54 @@ export const TOOLS: ToolDef[] = [
       required: ['suiObjectId', 'memwalAccountId', 'namespace', 'title'],
     },
     handler: ({ openx, args }) => apiFetch(openx, '/v3/memory/marketplace/publish', 'POST', args),
+  },
+
+  // ─── Agent marketplace tools (PRD-W7 — Sui-USDC paywalled agents) ─────
+  // PAYMENT NOTE: openx_agent_hire is a paid tool. The agent host must
+  // provide a Sui wallet (OPENX_WALLET_ADDRESS) with USDC balance. On a 402
+  // challenge the host signs a USDC transfer to the agent's seller address
+  // and retries with `x-payment: <digest>`. See openx_agent_payment_info
+  // for the cheap, unauthenticated price-check before paying.
+  {
+    name: 'openx_agent_list',
+    description:
+      'List published Sui-native paid agents. Each entry includes slug, persona, pricing per rail (sui_usdc/x402/mpp), and the seller wallet. Use openx_agent_payment_info for the canonical price + USDC coin type before hiring.',
+    paid: false,
+    inputSchema: {
+      type: 'object',
+      properties: { domain: tStr, q: tStr, limit: tInt },
+    },
+    handler: ({ openx, args }) => apiFetch(openx, '/v3/marketplace/listings', 'GET', undefined, args),
+  },
+  {
+    name: 'openx_agent_payment_info',
+    description:
+      'Cheap unauthenticated price-check for a Sui paid agent. Returns {price_usdc, asset_coin_type, payee_address, paywall_url, public_url}. The agent host should call this BEFORE openx_agent_hire to verify it has enough USDC balance to cover `price_usdc` of the asset at `asset_coin_type`. No payment, no auth, no rate limit.',
+    paid: false,
+    inputSchema: {
+      type: 'object',
+      properties: { slug: tStr },
+      required: ['slug'],
+    },
+    handler: ({ openx, args }) =>
+      apiFetch(openx, `/v3/marketplace/agents/${args.slug}/payment-info`, 'GET'),
+  },
+  {
+    name: 'openx_agent_hire',
+    description:
+      'Hire a Sui-native paid agent to answer a question or perform a task. PAYMENT: the seller charges `pricing.sui_usdc` USDC per call. The host must have OPENX_WALLET_ADDRESS set with sufficient USDC balance. On 402, the OpenX MCP runtime signs the USDC transfer with OPENX_WALLET_PRIVATE_KEY and retries automatically. Without a configured private key the host receives the 402 envelope and must sign + retry itself. Returns {answer, citations, attestation}.',
+    paid: true,
+    inputSchema: {
+      type: 'object',
+      properties: { slug: tStr, question: tStr, upload_ids: { type: 'array', items: tStr } },
+      required: ['slug', 'question'],
+    },
+    _meta: { 'x-x402': { method: 'sui-usdc', currency: 'USDC' } },
+    handler: ({ openx, args }) =>
+      apiFetch(openx, `/v3/agents/${args.slug}/try`, 'POST', {
+        question: args.question,
+        uploadIds: args.upload_ids,
+      }),
   },
 ];
 

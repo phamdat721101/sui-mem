@@ -20,7 +20,8 @@
  *     resolved at module level via env (matching the rest of routes/).
  */
 
-import { Router, type Request, type Response } from 'express';
+import { type Request, type Response } from 'express';
+import { hardenedRouter } from '../lib/routerSafety';
 import { pool } from '../db';
 import { logger } from '../lib';
 import { agentX402Middleware, loadAgentBySlug, type AgentRow } from '../middleware/agentX402';
@@ -29,7 +30,7 @@ import { runInference, recallFromKnowledgeChunks, type InferenceDeps } from '../
 import * as ledger from '../services/paidCallLedger';
 import { createWalrusStore, createPhalaClient } from '@fhe-ai-context/sui-sdk';
 
-const router = Router();
+const router = hardenedRouter();
 
 // ─── Shared inference deps (lazy singleton) ─────────────────────────────
 
@@ -172,20 +173,26 @@ router.post('/:slug/uploads', async (req: Request, res: Response) => {
 });
 
 // ─── /:slug/try — unified free + paid dispatcher ───────────────────────
+//
+// Free quota source-of-truth: paid_calls.method='demo'. Persistent across
+// restarts (the previous in-memory Map reset on every deploy → buyers got
+// unlimited free calls → screenshot bug). Per-agent override via
+// agents.daily_request_cap; falls back to OPENX_AGENT_FREE_DAILY_CAP if NULL.
+const FREE_DAILY_CAP_DEFAULT = Number(process.env.OPENX_AGENT_FREE_DAILY_CAP ?? '5');
 
-const FREE_DAILY_CAP = Number(process.env.OPENX_AGENT_FREE_DAILY_CAP ?? '5');
-const freeBucket = new Map<string, { count: number; dayStart: number }>();
-function checkFreeQuota(slug: string, ip: string): boolean {
-  const today = Math.floor(Date.now() / 86_400_000);
-  const key = `${slug}:${ip}`;
-  const e = freeBucket.get(key);
-  if (!e || e.dayStart !== today) {
-    freeBucket.set(key, { count: 1, dayStart: today });
-    return true;
-  }
-  if (e.count >= FREE_DAILY_CAP) return false;
-  e.count += 1;
-  return true;
+async function checkFreeQuota(agent: AgentRow, ip: string): Promise<{ allowed: boolean; used: number; cap: number }> {
+  const cap = Math.max(0, agent.daily_request_cap ?? FREE_DAILY_CAP_DEFAULT);
+  if (cap === 0) return { allowed: false, used: 0, cap };
+  // Index `paid_calls_freemium_idx (buyer, agent_id, method)` covers this lookup.
+  const r = await pool.query<{ used: string }>(
+    `SELECT COUNT(*)::text AS used
+       FROM paid_calls
+      WHERE agent_id = $1 AND buyer = $2 AND method = 'demo'
+        AND created_at >= now() - interval '24 hours'`,
+    [agent.id, ip],
+  );
+  const used = Number(r.rows[0]?.used ?? '0');
+  return { allowed: used < cap, used, cap };
 }
 
 function clientIp(req: Request): string {
@@ -240,15 +247,26 @@ async function answerWithAgent(
   }
 }
 
-// Free path — no payment_coin_object_id in body. Rate-limited to N/day per IP.
+// Free path — no paid-mode signal in body. Rate-limited per buyer/IP/day.
 router.post('/:slug/try', async (req: Request, res: Response, next) => {
-  if (req.body?.payment_coin_object_id) return next(); // hand off to paid mw
+  // Forward to paid middleware whenever the buyer is signalling a paid
+  // attempt — either the legacy sponsored flow (payment_coin_object_id +
+  // optional X-PAYMENT) OR the new self-settled flow (settled_tx_digest).
+  if (req.body?.payment_coin_object_id || req.body?.settled_tx_digest) return next();
   const agent = await loadAgentBySlug(String(req.params.slug));
   if (!agent) return res.status(404).json({ error: 'agent_not_found' });
-  if (!checkFreeQuota(agent.slug, clientIp(req))) {
-    return res
-      .status(429)
-      .json({ error: 'free_daily_cap_reached', detail: `Pay $${agent.pricing?.sui_usdc ?? '?'} to continue` });
+  const ip = clientIp(req);
+  const quota = await checkFreeQuota(agent, ip);
+  if (!quota.allowed) {
+    return res.status(429).json({
+      error: 'free_daily_cap_reached',
+      detail: `Free tier exhausted (${quota.used}/${quota.cap} today). Pay $${agent.pricing?.sui_usdc ?? '?'} USDC per call to continue.`,
+      free_used: quota.used,
+      free_cap: quota.cap,
+      price_usdc: agent.pricing?.sui_usdc ?? null,
+      payee_address: agent.owner_address,
+      asset_coin_type: process.env.OPENX_USDC_COIN_TYPE ?? null,
+    });
   }
   req.agentRow = agent;
   await answerWithAgent(req, res, agent, false);

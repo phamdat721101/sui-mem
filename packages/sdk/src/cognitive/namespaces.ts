@@ -78,6 +78,36 @@ export function parseCogNamespace(
 }
 
 /**
+ * PRD-W6 — runtime guard used by `namespaceDelegateService.resolveSeller`.
+ *
+ * Returns `true` iff `ns` is a cognitive namespace at L2..L5 that belongs to
+ * the given `agentOrBrainId`. The seller-namespace delegate key (W6 role
+ * `seller-namespace`) is allowed to sign MemWal writes only when this
+ * predicate fires `true`. L1 is rejected because L1 episodic is process-local
+ * and never delegate-signed.
+ *
+ * Pure: no I/O. Reuses `parseCogNamespace` so the regex remains the single
+ * source of truth (PRD-10 invariant).
+ */
+export function isCogNamespaceForAgent(ns: string, agentOrBrainId: string): boolean {
+  if (!agentOrBrainId) return false;
+  const parsed = parseCogNamespace(ns);
+  if (!parsed) return false;
+  if (parsed.level === 1) return false; // L1 is per-session, not delegate-signed
+  return parsed.brainId === agentOrBrainId;
+}
+
+/**
+ * PRD-W6 — namespace pattern stored on `memwal_delegate_keys.cog_namespace_pattern`.
+ * Used as a documentation string in Postgres + as the input to
+ * `isCogNamespaceForAgent` at runtime. Format: `cog-l[2345]-{agentId}`.
+ */
+export function cogNamespacePatternForAgent(agentOrBrainId: string): string {
+  if (!agentOrBrainId) throw new Error('cogNamespacePatternForAgent: agentOrBrainId required');
+  return `cog-l[2345]-${agentOrBrainId}`;
+}
+
+/**
  * Dual-write contract — used by `cognitiveMemoryService` and any future
  * surface that wants to mirror a Postgres-stored cognitive memory into
  * MemWal in the background.

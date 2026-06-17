@@ -19,7 +19,8 @@
  *     is one call: `invalidateProvider(slug)`.
  */
 
-import { Router, type Request, type Response } from 'express';
+import { type Request, type Response } from 'express';
+import { hardenedRouter } from '../lib/routerSafety';
 import { logger } from '../lib';
 import {
   agentX402Middleware,
@@ -30,7 +31,7 @@ import { runInference, recallFromKnowledgeChunks, type InferenceDeps } from '../
 import { pool } from '../db';
 import { createWalrusStore, createPhalaClient } from '@fhe-ai-context/sui-sdk';
 
-const router = Router();
+const router = hardenedRouter();
 
 // ─── Inference deps singleton (shared with /v3/agents) ──────────────────
 

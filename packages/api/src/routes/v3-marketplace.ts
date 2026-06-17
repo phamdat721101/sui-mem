@@ -15,13 +15,14 @@
  *   - DIP: pool is module-level (matches the rest of routes/*).
  */
 
-import { Router, Request, Response } from 'express';
+import { Request, Response } from 'express';
+import { hardenedRouter } from '../lib/routerSafety';
 import { pool } from '../db';
 import { logger } from '../lib';
 import type { AuthRequest } from '../middleware/auth';
 import { publish, type SellerPublishInput } from '../services/sellerPublishService';
 
-const router = Router();
+const router = hardenedRouter();
 
 const VALID_DOMAINS = new Set([
   'marketing', 'finance', 'research', 'engineering', 'generalist', 'other',
@@ -241,6 +242,222 @@ function explorerUrls(walrusBlobId: string | null, suiTxDigest: string | null) {
   };
 }
 
+// ─── Editable-config validators (mirror of sellerPublishService) ─────────
+//
+// SOLID: kept inline (5 lines) instead of exporting from publishService to
+// preserve the publish-service's SRP. If the lists ever drift, validation
+// is per-route which is the correct surface for a per-route validator.
+const EDITABLE_DOMAINS = ['marketing', 'finance', 'research', 'engineering', 'generalist', 'other'] as const;
+const EDITABLE_TIERS = ['basic', 'verified', 'tee_attested'] as const;
+const EDITABLE_RAILS = ['x402', 'mpp', 'sui_usdc'] as const;
+type EditableDomain = (typeof EDITABLE_DOMAINS)[number];
+type EditableTier = (typeof EDITABLE_TIERS)[number];
+
+interface AgentEditableRow {
+  id: string;
+  slug: string;
+  brain_id: number;
+  owner_address: string;
+  domain: EditableDomain | null;
+  short_description: string | null;
+  long_description: string | null;
+  verification_tier: EditableTier | null;
+  tags: string[] | null;
+  title: string | null;
+  persona: { system_prompt?: string | null; tools?: string[] | null } | null;
+  pricing: { x402?: string | null; mpp?: string | null; sui_usdc?: string | null } | null;
+  /** Free /try calls per buyer per 24h. NULL = use OPENX_AGENT_FREE_DAILY_CAP env (5). */
+  daily_request_cap: number | null;
+  chain: string;
+}
+
+/**
+ * GET /v3/marketplace/seller/agents/:slug — owner-only full editable record.
+ * Joins agents + brains so the config page receives every editable field.
+ */
+router.get('/seller/agents/:slug', async (req: AuthRequest, res: Response) => {
+  if (!req.user?.address) return res.status(401).json({ error: 'auth required' });
+  const r = await pool.query<AgentEditableRow>(
+    `SELECT a.id, a.slug, a.brain_id, a.owner_address, a.domain, a.short_description,
+            b.description AS long_description,
+            a.verification_tier, b.tags, b.title, a.persona, a.pricing, a.daily_request_cap, a.chain
+       FROM agents a
+       JOIN brains b ON b.id = a.brain_id
+      WHERE a.slug = $1 AND lower(a.owner_address) = lower($2) AND a.chain = ANY($3::text[])`,
+    [String(req.params.slug), req.user.address, SUI_CHAINS],
+  );
+  const a = r.rows[0];
+  if (!a) return res.status(404).json({ error: 'agent_not_found' });
+  res.json({ agent: a });
+});
+
+/**
+ * PATCH /v3/marketplace/seller/agents/:slug — owner-only partial update.
+ * Body: any subset of {title, persona, short_description, long_description,
+ * domain, verification_tier, tags, pricing}. Per-field validation; only
+ * fields actually present in the body are updated.
+ *
+ * agents-table columns vs brains-table columns are split (title/description/
+ * tags live on brains; everything else on agents). Updates run in one tx.
+ *
+ * SOLID: this is the ONLY mutation surface for post-publish agent profile
+ * edits. Pricing is read by middleware/agentX402.ts at request time, so a
+ * PATCH takes effect on the very next paid call — no cache invalidation.
+ */
+router.patch('/seller/agents/:slug', async (req: AuthRequest, res: Response) => {
+  // SOLID: errors from this handler (Postgres CHECK violations etc.) propagate
+  // to the global errorHandler in lib/routerSafety.ts, which maps pg codes
+  // 23502/23503/23505/23514/22P02 to clean 4xx responses. The hardenedRouter
+  // wrapper in this file's `import` section makes async-throw → next(err)
+  // automatic, so this handler does NOT need an inline try/catch.
+  if (!req.user?.address) return res.status(401).json({ error: 'auth required' });
+  const owned = await loadOwnedAgent(String(req.params.slug), req.user.address);
+  if (!owned) return res.status(404).json({ error: 'agent_not_found' });
+  const b = (req.body ?? {}) as {
+    title?: string;
+    persona?: { system_prompt?: string; tools?: string[] };
+    short_description?: string;
+    long_description?: string | null;
+    domain?: string;
+    verification_tier?: string;
+    tags?: string[];
+    pricing?: { x402?: string | null; mpp?: string | null; sui_usdc?: string | null };
+    daily_request_cap?: number | null;
+  };
+
+  // Per-field validation. Only validate what's present.
+  if (b.title !== undefined && (b.title.length < 3 || b.title.length > 120)) {
+    return res.status(400).json({ error: 'title must be 3..120 chars' });
+  }
+  if (b.short_description !== undefined && (b.short_description.length < 10 || b.short_description.length > 240)) {
+    return res.status(400).json({ error: 'short_description must be 10..240 chars' });
+  }
+  if (b.long_description !== undefined && b.long_description !== null && b.long_description.length > 4000) {
+    return res.status(400).json({ error: 'long_description must be ≤4000 chars' });
+  }
+  if (b.domain !== undefined && !EDITABLE_DOMAINS.includes(b.domain as EditableDomain)) {
+    return res.status(400).json({ error: `invalid domain (allowed: ${EDITABLE_DOMAINS.join(', ')})` });
+  }
+  if (b.verification_tier !== undefined && !EDITABLE_TIERS.includes(b.verification_tier as EditableTier)) {
+    return res.status(400).json({ error: `invalid verification_tier (allowed: ${EDITABLE_TIERS.join(', ')})` });
+  }
+  if (b.tags !== undefined && (!Array.isArray(b.tags) || b.tags.length > 10)) {
+    return res.status(400).json({ error: 'tags must be a string[] with ≤10 entries' });
+  }
+  if (b.persona?.system_prompt !== undefined && b.persona.system_prompt.trim().length < 10) {
+    return res.status(400).json({ error: 'persona.system_prompt must be ≥10 chars' });
+  }
+  if (b.daily_request_cap !== undefined && b.daily_request_cap !== null) {
+    if (!Number.isInteger(b.daily_request_cap) || b.daily_request_cap < 0 || b.daily_request_cap > 10000) {
+      return res.status(400).json({ error: 'daily_request_cap must be an integer in [0, 10000]' });
+    }
+  }
+  if (b.pricing) {
+    for (const [rail, value] of Object.entries(b.pricing)) {
+      if (!EDITABLE_RAILS.includes(rail as 'sui_usdc')) {
+        return res.status(400).json({ error: `unknown pricing rail: ${rail}` });
+      }
+      if (value !== null && value !== undefined) {
+        const num = Number(value);
+        if (!(num > 0 && num <= 1000)) {
+          return res.status(400).json({ error: `pricing.${rail} must be a decimal in (0, 1000]` });
+        }
+      }
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // agents-table updates
+    const aSets: string[] = [];
+    const aVals: unknown[] = [];
+    let n = 1;
+    if (b.short_description !== undefined) { aSets.push(`short_description = $${n++}`); aVals.push(b.short_description); }
+    if (b.domain !== undefined)            { aSets.push(`domain            = $${n++}`); aVals.push(b.domain); }
+    if (b.verification_tier !== undefined) { aSets.push(`verification_tier = $${n++}`); aVals.push(b.verification_tier); }
+    if (b.daily_request_cap !== undefined) { aSets.push(`daily_request_cap = $${n++}`); aVals.push(b.daily_request_cap); }
+    if (b.persona)                         { aSets.push(`persona = COALESCE(persona,'{}'::jsonb) || $${n++}::jsonb`); aVals.push(JSON.stringify(b.persona)); }
+    if (b.pricing)                         { aSets.push(`pricing = COALESCE(pricing,'{}'::jsonb) || $${n++}::jsonb`); aVals.push(JSON.stringify(b.pricing)); }
+    if (aSets.length > 0) {
+      aVals.push(owned.id);
+      await client.query(`UPDATE agents SET ${aSets.join(', ')} WHERE id = $${n}`, aVals);
+    }
+
+    // brains-table updates (title, description, tags)
+    const bSets: string[] = [];
+    const bVals: unknown[] = [];
+    let m = 1;
+    if (b.title !== undefined)            { bSets.push(`title       = $${m++}`); bVals.push(b.title); }
+    if (b.long_description !== undefined) { bSets.push(`description = $${m++}`); bVals.push(b.long_description ?? ''); }
+    if (b.tags !== undefined)             { bSets.push(`tags        = $${m++}`); bVals.push(b.tags); }
+    if (bSets.length > 0) {
+      bVals.push(owned.brain_id);
+      await client.query(`UPDATE brains SET ${bSets.join(', ')} WHERE id = $${m}`, bVals);
+    }
+
+    if (aSets.length === 0 && bSets.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'no editable fields supplied' });
+    }
+
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  // Re-read for response
+  const r = await pool.query<AgentEditableRow>(
+    `SELECT a.id, a.slug, a.brain_id, a.owner_address, a.domain, a.short_description,
+            b.description AS long_description,
+            a.verification_tier, b.tags, b.title, a.persona, a.pricing, a.daily_request_cap, a.chain
+       FROM agents a JOIN brains b ON b.id = a.brain_id WHERE a.id = $1`,
+    [owned.id],
+  );
+  res.json({ agent: r.rows[0] });
+});
+
+/**
+ * GET /v3/marketplace/agents/:slug/payment-info \u2014 public, no auth.
+ * Single source of truth any client (human UI, agent host, MCP server) uses
+ * to introspect payment requirements. Mirrors what middleware/agentX402.ts
+ * will demand on a 402 challenge.
+ */
+router.get('/agents/:slug/payment-info', async (req: Request, res: Response) => {
+  const r = await pool.query<{
+    slug: string; owner_address: string;
+    pricing: { sui_usdc?: string | null; x402?: string | null; mpp?: string | null } | null;
+    daily_request_cap: number | null;
+  }>(
+    `SELECT slug, owner_address, pricing, daily_request_cap FROM agents
+      WHERE slug = $1 AND published = true AND chain = ANY($2::text[])`,
+    [String(req.params.slug), SUI_CHAINS],
+  );
+  const a = r.rows[0];
+  if (!a) return res.status(404).json({ error: 'agent_not_found' });
+  const price = a.pricing?.sui_usdc ?? a.pricing?.x402 ?? null;
+  const apiBase = (req.headers['x-forwarded-proto'] && req.headers['x-forwarded-host'])
+    ? `${req.headers['x-forwarded-proto']}://${req.headers['x-forwarded-host']}`
+    : `${req.protocol}://${req.get('host')}`;
+  res.json({
+    slug: a.slug,
+    payee_address: a.owner_address,
+    price_usdc: price,
+    asset_coin_type: process.env.OPENX_USDC_COIN_TYPE ?? null,
+    chain: 'sui',
+    network: process.env.SUI_NETWORK ?? 'testnet',
+    paywall_url: `${apiBase}/v3/agents/${a.slug}/try`,
+    public_url: `${apiBase}/api/v1/${a.slug}`,
+    daily_request_cap: a.daily_request_cap ?? Number(process.env.OPENX_AGENT_FREE_DAILY_CAP ?? '5'),
+    platform_treasury: process.env.OPENX_PLATFORM_TREASURY ?? null,
+    platform_bps: Math.min(Math.max(Number(process.env.OPENX_PLATFORM_BPS ?? '500'), 0), 10_000),
+  });
+});
+
 /**
  * GET /seller/agents/:slug/events — unified history feed.
  * UNIONs agent_training_events with paid_calls (mapped to event_type='settle').
@@ -315,7 +532,58 @@ router.post('/seller/agents/:slug/upload', async (req: AuthRequest, res: Respons
      RETURNING id, created_at`,
     [agent.id, b.walrus_blob_id, summary],
   );
-  res.status(201).json({ id: ins.rows[0].id, created_at: ins.rows[0].created_at });
+
+  // Bug B fix — chunk the uploaded file into knowledge_chunks so the agent
+  // can RAG over it via agentInference.recallFromKnowledgeChunks. The browser
+  // PUT the file directly to Walrus; we now fetch + extract + chunk on the
+  // server. Best-effort: failure here does NOT fail the upload (the metadata
+  // event was already recorded above). Skip files >10MB or unsupported types.
+  //
+  // SOLID: reuses the singleton PdfExtractor + the shared createWalrusStore
+  // — no new file, no new dep.
+  const CHUNK_MAX_BYTES = 10 * 1024 * 1024;
+  const CHUNK_WINDOW_CHARS = 1500;
+  const m = b.mime_type;
+  const isText = m.startsWith('text/') || m === 'application/json' || m === 'application/x-yaml' || m === 'application/yaml';
+  const isPdf = m === 'application/pdf';
+  let chunks_written = 0;
+  if ((isText || isPdf) && b.size_bytes <= CHUNK_MAX_BYTES) {
+    try {
+      let extracted = '';
+      if (isPdf) {
+        const { getPdfExtractor } = await import('../services/pdfExtractor');
+        const r = await getPdfExtractor().extract(b.walrus_blob_id);
+        if (r.status === 'ok') extracted = r.text;
+      } else {
+        const { createWalrusStore } = await import('@fhe-ai-context/sui-sdk');
+        const bytes = await createWalrusStore().fetch(b.walrus_blob_id);
+        extracted = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+      }
+      const trimmed = extracted.trim();
+      if (trimmed.length >= 20) {
+        const idxRow = await pool.query<{ max: number | string }>(
+          `SELECT COALESCE(MAX(chunk_index), -1) AS max FROM knowledge_chunks WHERE brain_id = $1`,
+          [agent.brain_id],
+        );
+        let nextIdx = Number(idxRow.rows[0]?.max ?? -1) + 1;
+        for (let i = 0; i < trimmed.length; i += CHUNK_WINDOW_CHARS) {
+          const piece = trimmed.slice(i, i + CHUNK_WINDOW_CHARS);
+          await pool.query(
+            `INSERT INTO knowledge_chunks (brain_id, chunk_index, content) VALUES ($1, $2, $3)`,
+            [agent.brain_id, nextIdx++, piece],
+          );
+          chunks_written++;
+        }
+      }
+    } catch (chunkErr) {
+      logger.warn(
+        { brainId: agent.brain_id, blob: b.walrus_blob_id, err: (chunkErr as Error)?.message },
+        'training:upload:chunk-failed',
+      );
+    }
+  }
+
+  res.status(201).json({ id: ins.rows[0].id, created_at: ins.rows[0].created_at, chunks_written });
 });
 
 /**

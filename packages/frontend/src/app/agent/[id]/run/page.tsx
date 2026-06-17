@@ -3,7 +3,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { api, type Listing } from '@/lib/api';
+import { useCurrentAccount, useSignAndExecuteTransaction, useSuiClient } from '@mysten/dapp-kit';
+import { Transaction } from '@mysten/sui/transactions';
+import { api, AGENT_BACKEND_URL, type Listing, type AgentPaymentInfo } from '@/lib/api';
 import { AgentRecentCalls } from '@/components/AgentRecentCalls';
 
 /**
@@ -45,7 +47,12 @@ export default function AgentRunPage() {
   const params = useParams<{ id: string }>();
   const slug = params?.id ?? '';
 
+  const account = useCurrentAccount();
+  const suiClient = useSuiClient();
+  const { mutateAsync: signAndExecuteTransaction } = useSignAndExecuteTransaction();
+
   const [listing, setListing] = useState<Listing | null>(null);
+  const [paymentInfo, setPaymentInfo] = useState<AgentPaymentInfo | null>(null);
   const [question, setQuestion] = useState('');
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -57,6 +64,7 @@ export default function AgentRunPage() {
   useEffect(() => {
     if (!slug) return;
     api.listing(slug).then(setListing);
+    api.agentPaymentInfo(slug).then(setPaymentInfo).catch(() => undefined);
   }, [slug]);
 
   async function handleFiles(files: FileList | null) {
@@ -126,6 +134,79 @@ export default function AgentRunPage() {
     }
   }
 
+  // ─── Self-settled pay flow ───────────────────────────────────────────
+  // Buyer signs AND executes a single PTB that splits a USDC coin and pays
+  // seller (95%) + platform (5%) directly. Buyer pays their own SUI gas.
+  // No sponsor wallet, no 402 dance — just one wallet popup. After the tx
+  // confirms, we POST the digest to /v3/agents/:slug/try and the server
+  // verifies on-chain via Sui RPC before running inference.
+  //
+  // SOLID: this is the cleanest paywall protocol — minimum trust surface
+  // (server only reads the chain, never holds a buyer's coin in transit).
+  async function payAndRun() {
+    if (!question.trim()) return setError('Type a question first.');
+    if (!account?.address) return setError('Connect a Sui wallet first.');
+    if (!paymentInfo?.asset_coin_type) return setError('Agent has no USDC coin type configured.');
+    if (!paymentInfo.price_usdc) return setError('Agent has no USDC price configured.');
+    if (!paymentInfo.platform_treasury) return setError('Platform treasury not configured on backend.');
+
+    setError(null);
+    setRunning(true);
+    setAnswer(null);
+    try {
+      // 1. Find a USDC coin in the buyer's wallet with sufficient balance.
+      const totalMicro = BigInt(Math.round(Number(paymentInfo.price_usdc) * 1_000_000));
+      const platformMicro = (totalMicro * BigInt(paymentInfo.platform_bps)) / 10_000n;
+      const sellerMicro = totalMicro - platformMicro;
+
+      const coins = await suiClient.getCoins({
+        owner: account.address,
+        coinType: paymentInfo.asset_coin_type,
+      });
+      const coin = coins.data.find((c) => BigInt(c.balance) >= totalMicro);
+      if (!coin) {
+        throw new Error(
+          `Need at least ${paymentInfo.price_usdc} USDC in wallet (asset ${paymentInfo.asset_coin_type.split('::').pop()}).`,
+        );
+      }
+
+      // 2. Build a PTB that splits the coin and transfers seller + platform cuts.
+      const tx = new Transaction();
+      const [sellerCoin, platformCoin] = tx.splitCoins(tx.object(coin.coinObjectId), [
+        sellerMicro,
+        platformMicro,
+      ]);
+      tx.transferObjects([sellerCoin], paymentInfo.payee_address);
+      tx.transferObjects([platformCoin], paymentInfo.platform_treasury);
+
+      // 3. Buyer signs + executes (one wallet popup, buyer pays gas in SUI).
+      // Cast through `unknown` to bridge the dual Transaction type version
+      // between @mysten/sui and @mysten/wallet-standard's nested copy.
+      const result = await signAndExecuteTransaction({
+        transaction: tx as unknown as Parameters<typeof signAndExecuteTransaction>[0]['transaction'],
+      });
+      const settledTxDigest = result.digest;
+
+      // 4. Hand the digest to the server. It verifies on-chain + runs inference.
+      const r = await fetch(`${AGENT_BACKEND_URL}/v3/agents/${encodeURIComponent(slug)}/try`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Buyer-Address': account.address },
+        body: JSON.stringify({
+          q: question.trim(),
+          upload_ids: uploads.map((u) => u.upload_id),
+          buyer_address: account.address,
+          settled_tx_digest: settledTxDigest,
+        }),
+      });
+      if (!r.ok) throw new Error(`server rejected payment ${r.status}: ${await r.text()}`);
+      setAnswer((await r.json()) as AnswerShape);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRunning(false);
+    }
+  }
+
   const price = listing?.pricing?.sui_usdc ?? listing?.pricing?.x402 ?? null;
 
   return (
@@ -143,7 +224,13 @@ export default function AgentRunPage() {
               </span>
             </div>
             <p className="font-mono text-xs text-on-surface-variant">
-              Free tier: 5 calls/day · paid: ${price ? Number(price).toFixed(4) : '?'} USDC/call
+              {(() => {
+                const cap = paymentInfo?.daily_request_cap;
+                const priceStr = price ? Number(price).toFixed(4) : '?';
+                if (cap === undefined) return `Loading pricing…`;
+                if (cap === 0) return `No free tier · $${priceStr} USDC per call`;
+                return `Free tier: ${cap} calls/day · paid: $${priceStr} USDC/call`;
+              })()}
             </p>
           </div>
           <Link
@@ -227,17 +314,33 @@ export default function AgentRunPage() {
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-outline-variant/20 pt-3">
             <span className="font-mono text-[10px] text-on-surface-variant">
-              Free /try uses Seal IBE for brain-blob privacy
+              {paymentInfo?.daily_request_cap === 0
+                ? account?.address
+                  ? `Paid only · click below: your wallet pops up to sign + execute a USDC transfer of $${paymentInfo.price_usdc ?? '?'} (you pay your own SUI gas, no sponsor)`
+                  : 'Paid only · connect a Sui wallet to sign + send the USDC transfer (you pay gas in SUI)'
+                : 'Free /try uses Seal IBE for brain-blob privacy'}
             </span>
             <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={runFree}
-                disabled={running || !question.trim()}
-                className="rounded-full bg-primary px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-on-primary hover:opacity-90 disabled:opacity-50"
-              >
-                {running ? 'Running…' : 'Try free'}
-              </button>
+              {paymentInfo?.daily_request_cap === 0 ? (
+                <button
+                  type="button"
+                  onClick={payAndRun}
+                  disabled={running || !question.trim() || !account?.address}
+                  className="rounded-full bg-secondary px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-on-secondary hover:opacity-90 disabled:opacity-50"
+                  title={!account?.address ? 'Connect a Sui wallet first' : undefined}
+                >
+                  {running ? 'Settling…' : `Pay $${paymentInfo.price_usdc ?? '?'} USDC`}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={runFree}
+                  disabled={running || !question.trim()}
+                  className="rounded-full bg-primary px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-on-primary hover:opacity-90 disabled:opacity-50"
+                >
+                  {running ? 'Running…' : 'Try free'}
+                </button>
+              )}
             </div>
           </div>
         </div>

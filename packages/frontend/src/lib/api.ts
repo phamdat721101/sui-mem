@@ -137,6 +137,56 @@ export interface TrainingEvent {
   explorer_urls: { walrus: string | null; sui: string | null };
 }
 
+// ─── Agent config (post-publish edits) ────────────────────────────────
+// SOLID: shapes mirror the backend AgentEditableRow (single source of truth
+// in v3-marketplace.ts). `null` is "field unset"; `undefined` in a patch is
+// "leave alone".
+export interface EditableAgent {
+  id: string;
+  slug: string;
+  brain_id: number;
+  owner_address: string;
+  title: string | null;
+  short_description: string | null;
+  long_description: string | null;
+  domain: PublishInput['domain'] | null;
+  verification_tier: 'basic' | 'verified' | 'tee_attested' | null;
+  tags: string[] | null;
+  persona: { system_prompt?: string | null; tools?: string[] | null } | null;
+  pricing: { x402?: string | null; mpp?: string | null; sui_usdc?: string | null } | null;
+  daily_request_cap: number | null;
+  chain: string;
+}
+
+export interface EditableAgentPatch {
+  title: string;
+  short_description: string;
+  long_description: string | null;
+  domain: PublishInput['domain'];
+  verification_tier: 'basic' | 'verified' | 'tee_attested';
+  tags: string[];
+  persona: { system_prompt?: string; tools?: string[] };
+  pricing: { x402?: string | null; mpp?: string | null; sui_usdc?: string | null };
+  daily_request_cap: number | null;
+}
+
+export interface AgentPaymentInfo {
+  slug: string;
+  payee_address: string;
+  price_usdc: string | null;
+  asset_coin_type: string | null;
+  chain: 'sui';
+  network: string;
+  paywall_url: string;
+  public_url: string;
+  /** Free /try calls per buyer per 24h. 0 = no free tier (paywall every call). */
+  daily_request_cap: number;
+  /** Sui address that receives the platform cut on every paid call. */
+  platform_treasury: string | null;
+  /** Platform cut in basis points (500 = 5%). */
+  platform_bps: number;
+}
+
 export const api = {
   listings: () =>
     getJson<{ listings: Listing[] }>('/v3/marketplace/listings').then((r) => r.listings),
@@ -275,6 +325,32 @@ export const api = {
     authedJson<{ id: string; walrus_blob_id: string | null; namespace: string; critique: string; created_at: string }>(
       'POST', `/v3/marketplace/seller/agents/${encodeURIComponent(slug)}/training-loop`, wallet, {},
     ),
+
+  // ─── Agent config (post-publish edits) ────────────────────────────────
+  // SOLID: thin authedJson wrappers; the backend in v3-marketplace.ts owns
+  // every validation rule. The config page is purely a form over these.
+  getOwnedAgent: (wallet: string, slug: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/marketplace/seller/agents/${encodeURIComponent(slug)}`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      const j = (await r.json()) as { agent: EditableAgent };
+      return j.agent;
+    }),
+  updateAgent: (wallet: string, slug: string, patch: Partial<EditableAgentPatch>) =>
+    authedJson<{ agent: EditableAgent }>(
+      'PATCH', `/v3/marketplace/seller/agents/${encodeURIComponent(slug)}`, wallet, patch,
+    ),
+  agentPaymentInfo: (slug: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/marketplace/agents/${encodeURIComponent(slug)}/payment-info`, {
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json() as Promise<AgentPaymentInfo>;
+    }),
 
   // ─── MemWal training surface ──────────────────────────────────────────
   memwalAccount: (wallet: string) =>

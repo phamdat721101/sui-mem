@@ -88,6 +88,14 @@ function TrainContent({ wallet, slug }: { wallet: string; slug: string }) {
             into your MemWal namespaces and surfaced in the history feed below with explorer URLs.
           </p>
         </div>
+        <div className="flex shrink-0 gap-2 text-sm">
+          <Link href={`/studio/agent/${slug}/config`} className="rounded border border-outline-variant px-3 py-1.5 hover:bg-surface-variant">
+            Config
+          </Link>
+          <Link href={`/agent/${slug}`} target="_blank" className="rounded border border-outline-variant px-3 py-1.5 hover:bg-surface-variant">
+            View public
+          </Link>
+        </div>
       </header>
 
       <div className="grid gap-4 md:grid-cols-2">

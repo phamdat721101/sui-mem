@@ -33,6 +33,7 @@ import {
   executeWithSponsor,
   finalizeSponsoredPtb,
   getSponsor,
+  getSuiClient,
   parseAndVerifyXPayment,
 } from './suiX402Core';
 import * as ledger from '../services/paidCallLedger';
@@ -73,6 +74,8 @@ export interface AgentRow {
   pricing: { x402?: string | null; mpp?: string | null; sui_usdc?: string | null };
   chain: string | null;
   published: boolean;
+  /** Per-agent free-tier cap (free /try calls per buyer per 24h). NULL = use env default. */
+  daily_request_cap: number | null;
 }
 
 /**
@@ -87,7 +90,7 @@ const SUI_CHAINS = ['sui', 'sui-testnet', 'sui-mainnet'];
 
 export async function loadAgentBySlug(slug: string): Promise<AgentRow | null> {
   const r = await pool.query(
-    `SELECT id, slug, brain_id, owner_address, persona, pricing, chain, published
+    `SELECT id, slug, brain_id, owner_address, persona, pricing, chain, published, daily_request_cap
        FROM agents
       WHERE slug = $1 AND published = true AND chain = ANY($2::text[])`,
     [slug, SUI_CHAINS],
@@ -143,6 +146,12 @@ function buildSplitPtb(args: {
 
 export function agentX402Middleware() {
   return async function agentX402(req: Request, res: Response, next: NextFunction) {
+    // SOLID: error handling is now centralized in `lib/routerSafety.ts` —
+    // any throw in this middleware (sponsor_gas_empty, missing sponsor key,
+    // pg errors, etc.) bubbles to the global errorHandler that maps it
+    // to a clean 503/4xx. The explicit env-presence checks below short-
+    // circuit BEFORE we touch the sponsor signer, so the most common
+    // misconfigurations return readable detail strings without throwing.
     if (!FEATURE()) return res.status(404).json({ error: 'agent_x402_disabled' });
     if (!USDC_COIN_TYPE) {
       return res.status(503).json({
@@ -154,6 +163,12 @@ export function agentX402Middleware() {
       return res.status(503).json({
         error: 'agent_x402_unconfigured',
         detail: 'set OPENX_PLATFORM_TREASURY (Sui address)',
+      });
+    }
+    if (!process.env.OPENX_LOOP_SPONSOR_PRIVATE_KEY) {
+      return res.status(503).json({
+        error: 'agent_x402_unconfigured',
+        detail: 'set OPENX_LOOP_SPONSOR_PRIVATE_KEY (sponsor wallet that pays gas for buyer-signed PTBs)',
       });
     }
 
@@ -175,6 +190,117 @@ export function agentX402Middleware() {
       return res.status(400).json({ error: 'buyer_address_required' });
     }
     if (!checkRateLimit(buyer)) return res.status(429).json({ error: 'rate_limit' });
+
+    // ── Self-settled path: buyer signed + executed their own PTB and just
+    //    sent us the digest. No sponsor key, no gas paid by us. We verify
+    //    on-chain via Sui RPC that the buyer actually paid the seller (and
+    //    optional platform treasury) the right USDC amount, then proceed.
+    //    SOLID: shortcut path; sponsored flow below stays intact for MCP.
+    const settledTxDigest = String(req.body?.settled_tx_digest ?? '');
+    if (settledTxDigest) {
+      let tx;
+      try {
+        // waitForTransaction polls until the tx is committed on the RPC the
+        // server hits (vs getTransactionBlock which fails immediately on
+        // "not found" before the public testnet RPC has propagated the tx
+        // the buyer just signed). Timeout kept short so a stuck submission
+        // returns 400 fast rather than hanging the request.
+        tx = await getSuiClient().waitForTransaction({
+          digest: settledTxDigest,
+          options: { showEffects: true, showBalanceChanges: true, showInput: true },
+          timeout: 15_000,
+          pollInterval: 500,
+        });
+      } catch (e) {
+        // Bad digest format / not-found-within-timeout / RPC error → 400.
+        return res.status(400).json({ error: 'invalid_tx_digest', detail: (e as Error)?.message ?? 'cannot fetch tx' });
+      }
+      if (!tx || tx.effects?.status?.status !== 'success') {
+        return res.status(400).json({ error: 'tx_not_successful', detail: tx?.effects?.status?.error });
+      }
+      const txSender = String(tx.transaction?.data?.sender ?? '').toLowerCase();
+      if (txSender !== buyer) {
+        return res.status(400).json({ error: 'tx_sender_mismatch', expected: buyer, actual: txSender });
+      }
+      const ageMs = Date.now() - Number(tx.timestampMs ?? 0);
+      if (ageMs > 10 * 60 * 1000) {
+        return res.status(400).json({ error: 'tx_too_old', detail: `${Math.round(ageMs / 1000)}s old; max 600s` });
+      }
+      // Verify USDC balance changes match the expected splits.
+      // Edge case: if buyer == seller (e.g., seller testing their own agent),
+      // the seller's net balance change will be 0 because they paid themselves.
+      // In that case, only enforce the platform cut. Otherwise enforce both.
+      const sellerCutMicro = (amountMicro * BigInt(10_000 - PLATFORM_BPS)) / 10_000n;
+      const platformCutMicro = amountMicro - sellerCutMicro;
+      const findIncrement = (target: string): bigint => {
+        const t = target.toLowerCase();
+        for (const bc of tx.balanceChanges ?? []) {
+          if (bc.coinType !== USDC_COIN_TYPE) continue;
+          const owner = bc.owner as { AddressOwner?: string } | string;
+          const ownerAddr = typeof owner === 'object' && owner.AddressOwner ? owner.AddressOwner.toLowerCase() : '';
+          if (ownerAddr === t) return BigInt(bc.amount);
+        }
+        return 0n;
+      };
+      const buyerIsSeller = buyer === agent.owner_address.toLowerCase();
+      if (!buyerIsSeller) {
+        const sellerGot = findIncrement(agent.owner_address);
+        if (sellerGot < sellerCutMicro) {
+          return res.status(400).json({
+            error: 'seller_underpaid',
+            detail: `seller received ${sellerGot} micro USDC; expected ≥ ${sellerCutMicro}`,
+          });
+        }
+      }
+      if (PLATFORM_TREASURY && platformCutMicro > 0n) {
+        const platformIsBuyer = buyer === PLATFORM_TREASURY.toLowerCase();
+        if (!platformIsBuyer) {
+          const platformGot = findIncrement(PLATFORM_TREASURY);
+          if (platformGot < platformCutMicro) {
+            return res.status(400).json({
+              error: 'platform_underpaid',
+              detail: `platform received ${platformGot} micro USDC; expected ≥ ${platformCutMicro}`,
+            });
+          }
+        }
+      }
+      // In the buyer==seller (and/or buyer==platform) case, also assert that
+      // the buyer actually spent USDC — at minimum the non-self portion. Net
+      // change for buyer must be ≤ -(amountMicro - sumOfSelfReceived).
+      const buyerNet = findIncrement(buyer);
+      const expectedSpend = -amountMicro
+        + (buyerIsSeller ? sellerCutMicro : 0n)
+        + (PLATFORM_TREASURY && buyer === PLATFORM_TREASURY.toLowerCase() ? platformCutMicro : 0n);
+      if (buyerNet > expectedSpend) {
+        return res.status(400).json({
+          error: 'buyer_underpaid',
+          detail: `buyer net USDC change ${buyerNet}; expected ≤ ${expectedSpend}`,
+        });
+      }
+      // Anti-replay: paid_calls UNIQUE(network, tx_hash) rejects duplicates.
+      await ledger.record({
+        agent_id: agent.id,
+        slug,
+        buyer,
+        amount_usdc: priceDecimal,
+        tx_hash: settledTxDigest,
+        network: NETWORK,
+        method: 'sui_usdc',
+      });
+      req.agentSettlement = {
+        txDigest: settledTxDigest,
+        amountMicro,
+        payer: buyer,
+        seller: agent.owner_address,
+        agentId: agent.id,
+        slug,
+      };
+      logger.info(
+        { tx_digest: settledTxDigest, slug, payer: buyer, amount_usdc: priceDecimal, mode: 'self-settled' },
+        'agentX402:settled',
+      );
+      return next();
+    }
 
     const xPayment = req.header('X-PAYMENT');
 

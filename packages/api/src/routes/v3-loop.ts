@@ -20,7 +20,8 @@
  * namespace synchronously after the on-chain commit. No new Postgres tables.
  */
 
-import { Router, type Request, type Response } from 'express';
+import { type Request, type Response } from 'express';
+import { hardenedRouter } from '../lib/routerSafety';
 import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
@@ -39,7 +40,7 @@ import { loopX402Middleware } from '../middleware/loopX402';
 import type { AuthRequest } from '../middleware/auth';
 import { logger } from '../lib';
 
-const router = Router();
+const router = hardenedRouter();
 
 // ─── Singletons ──────────────────────────────────────────────────────────
 

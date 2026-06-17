@@ -99,6 +99,9 @@ function Studio({ wallet }: { wallet: string }) {
                     {a.calls_total} calls · earned ${Number(a.earned_total).toFixed(4)}
                   </span>
                   <div className="flex items-center gap-3">
+                    <Link href={`/studio/agent/${a.slug}/config`} className="font-mono text-[11px] text-secondary hover:underline">
+                      config ↗
+                    </Link>
                     <Link href={`/studio/agent/${a.slug}/train`} className="font-mono text-[11px] text-secondary hover:underline">
                       train ↗
                     </Link>

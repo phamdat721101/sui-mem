@@ -20,7 +20,8 @@
  * adapter only forwards them to the upstream MemWal SDK over a TLS channel.
  */
 
-import { Router, type Response } from 'express';
+import { type Response } from 'express';
+import { hardenedRouter } from '../lib/routerSafety';
 import { pool } from '../db';
 import { logger } from '../lib';
 import type { AuthRequest } from '../middleware/auth';
@@ -33,7 +34,7 @@ import {
 } from '@fhe-ai-context/sdk';
 import { getMemWalOperator } from '../services/memwalOperator';
 
-const router = Router();
+const router = hardenedRouter();
 
 // Adapter cache — keyed by Sui MemWalAccount object id. Operator runs one
 // adapter per (account, OpenX-pool) pair. For the buyer-side operator
@@ -208,19 +209,41 @@ router.post('/remember', requireSuiWallet, async (req: AuthRequest, res) => {
     // SOLID: single conditional, no architectural fork. One swap-point
     // (the env var) governs real vs mock for /train.
     if (process.env.MEMWAL_FALLBACK_MODE === 'mock') {
-      const { createHash, randomBytes } = await import('node:crypto');
+      // Real Walrus PUT — replaces the historical synthetic `local:` placeholder
+      // so the audit trail + the seller-facing `walrus blob ↗` link actually
+      // resolve. SOLID: reuses the shared `createWalrusStore` from
+      // @fhe-ai-context/sui-sdk (resilient-call wrapped, single source of
+      // truth for Walrus HTTP). The synthetic-id branch becomes a TRUE
+      // error fallback — only used when even the publisher refuses.
       const ns = String(namespace ?? 'cog-l3-default');
-      const contentHash = createHash('sha256')
-        .update(`${ns}|${text}`)
-        .digest('hex')
-        .slice(0, 16);
-      const blob_id = `local:${ns}:${contentHash}:${randomBytes(4).toString('hex')}`;
+      let blob_id: string;
+      let walrusOk = true;
+      try {
+        const { createWalrusStore } = await import('@fhe-ai-context/sui-sdk');
+        const store = createWalrusStore();
+        const bytes = new TextEncoder().encode(text);
+        const upload = await store.upload(bytes);
+        if (!upload.blobs[0]?.blobId) throw new Error('walrus_publish_returned_no_blob_id');
+        blob_id = upload.blobs[0].blobId;
+      } catch (walrusErr) {
+        walrusOk = false;
+        const { createHash, randomBytes } = await import('node:crypto');
+        const contentHash = createHash('sha256')
+          .update(`${ns}|${text}`)
+          .digest('hex')
+          .slice(0, 16);
+        blob_id = `local:${ns}:${contentHash}:${randomBytes(4).toString('hex')}`;
+        logger.warn(
+          { ns, err: (walrusErr as Error)?.message ?? String(walrusErr) },
+          'memwal:remember:walrus-put-failed',
+        );
+      }
+
       // Dual-write into knowledge_chunks so the public agent API
       // (/api/v1/<slug>) can RAG over Sui-trained knowledge. The namespace
       // convention is cog-l{level}-{brainId}; we extract the integer brain
-      // id and append a chunk row. Real-mode (MemWal upstream live) does
-      // not write here — recall comes from Walrus directly. Best-effort:
-      // failure to write the mirror does NOT fail the train call.
+      // id and append a chunk row. Best-effort: failure to write the mirror
+      // does NOT fail the call.
       const m = ns.match(/^cog-l\d+-(\d+)/);
       if (m) {
         const brainId = Number(m[1]);
@@ -242,10 +265,10 @@ router.post('/remember', requireSuiWallet, async (req: AuthRequest, res) => {
         }
       }
       logger.warn(
-        { wallet, accountId, ns, err: (e as Error)?.message ?? String(e) },
+        { wallet, accountId, ns, walrus_ok: walrusOk, err: (e as Error)?.message ?? String(e) },
         'memwal:remember:fallback-mock',
       );
-      return res.json({ ok: true, blob_id, job_id: null, mode: 'mock-fallback' });
+      return res.json({ ok: true, blob_id, job_id: null, mode: walrusOk ? 'walrus-direct' : 'mock-fallback' });
     }
     sendMemWalError(res, e);
   }

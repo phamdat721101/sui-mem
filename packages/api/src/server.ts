@@ -23,6 +23,7 @@ import v3LoopRouter from './routes/v3-loop';
 import v3AgentsRouter from './routes/v3-agents';
 import v1PublicRouter from './routes/v1Public';
 import mcpRouter from './routes/mcp';
+import { errorHandler } from './lib/routerSafety';
 import {
   logger,
   correlationId,
@@ -88,6 +89,12 @@ app.use('/v3/loop', auth, v3LoopRouter);
 // /mcp — MCP JSON-RPC 2.0 gateway. Public; the -32402 envelope on paid
 // tools is the paywall.
 app.use('/mcp', mcpRouter);
+
+// Global error handler — MUST be last in the middleware chain. Maps Postgres
+// data-validity errors, Sui x402 / sponsor errors, and http-status-bearing
+// errors to clean structured responses. Hardens every route attached via
+// hardenedRouter() against process crashes from async-handler throws.
+app.use(errorHandler);
 
 const PORT = Number(process.env.PORT ?? 3001);
 

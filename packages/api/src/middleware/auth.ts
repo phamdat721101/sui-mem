@@ -26,6 +26,7 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/agents\/search$/,
   /^(?:\/marketplace)?\/listings$/,
   /^(?:\/marketplace)?\/listings\/[^/]+$/,
+  /^(?:\/marketplace)?\/agents\/[^/]+\/payment-info$/,
   /^(?:\/marketplace)?\/workflows$/,
   /^(?:\/marketplace)?\/workflows\/[^/]+$/,
   /^(?:\/marketplace)?\/workflows\/[^/]+\/recent$/,

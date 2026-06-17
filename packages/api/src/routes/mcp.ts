@@ -8,11 +8,12 @@
  * paid tools' 402 envelope is the paywall (-32402 JSON-RPC error code).
  */
 
-import { Router, type Request, type Response } from 'express';
+import { type Request, type Response } from 'express';
+import { hardenedRouter } from '../lib/routerSafety';
 import { OpenXMcpServer, type OpenXClient } from '@fhe-ai-context/sdk';
 import { logger } from '../lib';
 
-const router = Router();
+const router = hardenedRouter();
 
 const openxClient: OpenXClient = {
   apiUrl: process.env.OPENX_API_URL ?? 'http://localhost:3001',
