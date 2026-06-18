@@ -26,6 +26,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { href: '/', icon: 'home', label: 'Home' },
   { href: '/marketplace', icon: 'storefront', label: 'Marketplace' },
+  { href: '/activity', icon: 'receipt_long', label: 'Activity', requiresWallet: true },
   { href: '/studio', icon: 'science', label: 'Studio', requiresWallet: true },
   { href: '/settings', icon: 'tune', label: 'Settings', requiresWallet: true },
 ];

@@ -368,6 +368,149 @@ export const api = {
     fetch(`${AGENT_BACKEND_URL}/v3/memory/operator/stats`, {
       headers: { 'x-wallet-address': wallet },
     }).then((r) => r.json()),
+
+  // ─── PRD-W v1.1 — upgrade wizard + daily-run + buyer surfaces ────────
+  upgradePreview: (wallet: string, agentObjectId: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/seller/agents/${encodeURIComponent(agentObjectId)}/upgrade-preview`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(`${r.status}`);
+      return r.json() as Promise<{
+        distribution: Record<'project' | 'area' | 'resource' | 'archive', number>;
+        sample: Array<{
+          id: number; namespace: string;
+          predicted: { para_kind: string; area_slug: string | null };
+          created_at: string;
+        }>;
+      }>;
+    }),
+  upgradeAgent: (
+    wallet: string,
+    agentObjectId: string,
+    body: { workflow_walrus_blob_id: string; stop_condition_walrus_blob_id?: string; area_slugs: string[] },
+  ) =>
+    authedJson<{ ok: true; declared_areas: number; pending_chain_ptb: { kind: string } }>(
+      'POST',
+      `/v3/loop/seller/agents/${encodeURIComponent(agentObjectId)}/upgrade`,
+      wallet,
+      body,
+    ),
+
+  listSubscriptions: (wallet: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/subscriptions`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (!r.ok) return { subscriptions: [] };
+      return r.json() as Promise<{
+        subscriptions: Array<{
+          subscription_object_id: string; agent_id: string;
+          area_slug: string | null; cron_utc_minute: number;
+          runs_remaining: number; max_per_run_micro: number;
+          next_run_ts: number; last_run_ts: number | null;
+          cancelled_at: string | null;
+        }>;
+      }>;
+    }),
+
+  vault: (wallet: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/buyer/vault`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then((r) => r.json() as Promise<{
+      entries: Array<{
+        job_id: string; area_slug: string | null;
+        artifact_name: string; walrus_blob_id: string;
+        mime_type: string; created_at: string;
+      }>;
+    }>),
+
+  // Seller workflow YAML — view + edit (PRD-W v1.1 seller surface).
+  getWorkflow: (wallet: string, agentObjectId: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/seller/agents/${encodeURIComponent(agentObjectId)}/workflow`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then((r) => r.json() as Promise<{
+      workflow: WorkflowYaml | null;
+      updated_at?: string;
+    }>),
+  saveWorkflow: (wallet: string, agentObjectId: string, workflow: WorkflowYaml) =>
+    authedJson<{ workflow: WorkflowYaml; updated_at: string }>(
+      'PATCH',
+      `/v3/loop/seller/agents/${encodeURIComponent(agentObjectId)}/workflow`,
+      wallet,
+      workflow,
+    ),
+
+  // Daily-run subscription PTB-build envelope (server returns intent until
+  // the SDK builder lands; UI demos the shape today).
+  subscribeWorkflow: (wallet: string, body: {
+    agent_object_id: string; template_walrus_blob_id: string;
+    area_slug?: string; cron_utc_minute: number; runs: number;
+    max_per_run_micro: number; budget_coin_object_id: string;
+  }) =>
+    authedJson<{
+      ok: true; deferred_until?: string;
+      pending: Record<string, unknown>;
+    }>('POST', '/v3/loop/subscriptions', wallet, body),
+
+  // Right-to-forget — buyer-initiated 7d cooling-off delete of per-buyer slot.
+  requestRtf: (wallet: string, agent_id: string, reason?: string) =>
+    authedJson<{ request: { id: number; status: string }; cooling_off_days: number }>(
+      'POST', '/v3/loop/buyer/right-to-forget', wallet, { agent_id, reason },
+    ),
+
+  // PRD-S — AI workflow synthesis (seller, owner-gated).
+  synthesizeWorkflow: (
+    wallet: string,
+    slug: string,
+    body: { description: string; category?: string },
+  ) =>
+    authedJson<{
+      workflow: WorkflowYaml;
+      reasoning: string;
+      inferred_category: string;
+    }>(
+      'POST',
+      `/v3/loop/seller/agents/${encodeURIComponent(slug)}/workflow/synthesize`,
+      wallet,
+      body,
+    ),
+
+  // PRD-S — buyer instant run (uses MockStepExecutor on the server).
+  runWorkflowNow: (wallet: string, slug: string, body: { request: string }) =>
+    authedJson<{
+      steps_completed: number;
+      steps_total: number;
+      per_step: Array<{ id: string; phase: string; status: string; spent_micro: number; output: Record<string, unknown> }>;
+      final_output: string;
+      ms: number;
+    }>(
+      'POST',
+      `/v3/loop/agents/${encodeURIComponent(slug)}/run-workflow`,
+      wallet,
+      body,
+    ),
+};
+
+export type WorkflowStep = {
+  id: string;
+  capability: string;
+  phase?: 'capture' | 'organize' | 'distill' | 'express';
+  depends_on: string[];
+  inputs?: Record<string, unknown>;
+  output_schema?: Record<string, string>;
+  on_failure?: 'retry-once' | 'halt' | 'continue-skip';
+  max_micro_usdc?: number;
+  risk_tier?: 'low' | 'medium' | 'high';
+};
+
+export type WorkflowYaml = {
+  version: 'v1.1';
+  name: string;
+  para?: { default_kind?: 'project' | 'area' | 'resource'; area_slug?: string };
+  steps: WorkflowStep[];
 };
 
 /** Best price across rails — UI display only; server is authoritative. */

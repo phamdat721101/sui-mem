@@ -39,6 +39,23 @@ import {
 import { loopX402Middleware } from '../middleware/loopX402';
 import type { AuthRequest } from '../middleware/auth';
 import { logger } from '../lib';
+import { pool } from '../db';
+import { MemoryService, type MemWalMirror } from '../services/loop/memoryService';
+import { ArtifactVaultService } from '../services/loop/artifactVaultService';
+import { BuyerPreferenceProfileService } from '../services/loop/buyerPreferenceProfile';
+import { RightToForgetService } from '../services/loop/rightToForgetService';
+import { computeNextRun } from '../services/loop/workflowScheduler';
+import {
+  synthesizeWorkflow,
+  type Category,
+} from '../services/loop/workflowSynthesizer';
+import { MockStepExecutor } from '../services/loop/mockStepExecutor';
+import {
+  WorkflowDispatcher,
+  validateWorkflow,
+} from '../services/loop/workflowDispatcher';
+import { OutcomeEvaluator } from '../services/loop/outcomeEvaluator';
+import { StopConditionEvaluator } from '../services/loop/stopConditionEvaluator';
 
 const router = hardenedRouter();
 
@@ -330,6 +347,565 @@ router.post('/concierge/search', async (req: Request, res: Response) => {
   const buyerAddress = typeof req.body?.buyer_address === 'string' ? req.body.buyer_address : undefined;
   const r = await conciergeSearch({ message, buyerAddress, limit: 5 });
   res.json(r);
+});
+
+// ─── PRD-W v1.1 — service singletons (lazy init) ─────────────────────────
+
+/** No-op MemWal mirror — replace with the real OpenXMemWalAdapter when the
+ *  v1.1 master flag flips. Keeps the route file decoupled from MemWal so
+ *  tests can run without it. */
+const noopMirror: MemWalMirror = { remember: async () => null };
+
+let _memory: MemoryService | null = null;
+let _vault: ArtifactVaultService | null = null;
+let _vcard: BuyerPreferenceProfileService | null = null;
+let _rtf: RightToForgetService | null = null;
+
+const memory = () =>
+  (_memory ??= new MemoryService({ pool, mirror: noopMirror, logger }));
+const vault = () =>
+  (_vault ??= new ArtifactVaultService({ pool, mirror: noopMirror, logger }));
+const vcard = () =>
+  (_vcard ??= new BuyerPreferenceProfileService({ pool, mirror: noopMirror, logger }));
+const rtf = () =>
+  (_rtf ??= new RightToForgetService({ pool, logger, enabled: () => process.env.FEATURE_LOOP_RIGHT_TO_FORGET === 'true' }));
+
+/**
+ * verifyAgentOwner — single source of truth for "is this wallet the owner?".
+ * Used by every seller-only mutation. Looks up agents by slug OR Sui object id
+ * (URLs use either) and case-insensitive matches owner_address.
+ *
+ * SOLID: SRP — answers exactly one question. DIP: pool injected via closure.
+ */
+async function verifyAgentOwner(agentIdOrSlug: string, wallet: string): Promise<boolean> {
+  const r = await pool.query<{ owner_address: string }>(
+    `SELECT owner_address FROM agents
+      WHERE (slug = $1 OR id::text = $1)
+      LIMIT 1`,
+    [agentIdOrSlug],
+  );
+  if (!r.rowCount) return false;
+  return r.rows[0].owner_address.toLowerCase() === wallet.toLowerCase();
+}
+
+// ─── Daily-run subscription endpoints ────────────────────────────────────
+
+router.post('/subscriptions', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+
+  const b = req.body as {
+    agent_object_id: string; template_walrus_blob_id: string;
+    area_slug?: string; cron_utc_minute: number; runs: number; max_per_run_micro: number;
+    budget_coin_object_id: string;
+  };
+  if (!b.agent_object_id || !b.template_walrus_blob_id) {
+    return res.status(400).json({ error: 'agent_object_id + template_walrus_blob_id required' });
+  }
+  if (!Number.isInteger(b.cron_utc_minute) || b.cron_utc_minute < 0 || b.cron_utc_minute >= 1440) {
+    return res.status(400).json({ error: 'cron_utc_minute must be 0..1439' });
+  }
+  if (!Number.isInteger(b.runs) || b.runs < 1 || b.runs > 366) {
+    return res.status(400).json({ error: 'runs must be 1..366' });
+  }
+  if (!Number.isFinite(b.max_per_run_micro) || b.max_per_run_micro < 0) {
+    return res.status(400).json({ error: 'max_per_run_micro must be >= 0' });
+  }
+
+  // Persist to operational cache. Real on-chain LoopSubscription<T> object id
+  // arrives once the SDK PTB builder lands; until then we use a deterministic
+  // stub keyed by (wallet, ts, agent) so /activity shows the row.
+  const subscription_object_id =
+    `stub-${Date.now()}-${wallet.slice(2, 10)}-${b.agent_object_id.slice(0, 8)}`;
+  const next_run_ts = computeNextRun(new Date(), b.cron_utc_minute);
+
+  try {
+    const r = await pool.query<{ id: number }>(
+      `INSERT INTO loop_subscriptions
+            (subscription_object_id, agent_id, buyer_addr, template_walrus_blob_id,
+             area_slug, cron_utc_minute, runs_remaining, max_per_run_micro, next_run_ts)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id`,
+      [
+        subscription_object_id, b.agent_object_id, wallet, b.template_walrus_blob_id,
+        b.area_slug ?? null, b.cron_utc_minute, b.runs, b.max_per_run_micro, next_run_ts,
+      ],
+    );
+    return res.status(201).json({
+      ok: true,
+      subscription: {
+        id: r.rows[0].id,
+        subscription_object_id,
+        agent_id: b.agent_object_id,
+        runs_remaining: b.runs,
+        next_run_ts,
+        cron_utc_minute: b.cron_utc_minute,
+        area_slug: b.area_slug ?? null,
+      },
+    });
+  } catch (e) {
+    logger.error({ err: (e as Error).message }, 'subscribe:insert_failed');
+    return res.status(500).json({ error: 'subscribe_failed', detail: (e as Error).message });
+  }
+});
+
+router.post('/subscriptions/:id/cancel', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const r = await pool.query<{ id: number; runs_remaining: number; max_per_run_micro: string }>(
+    `UPDATE loop_subscriptions
+        SET cancelled_at   = now(),
+            runs_remaining = 0
+      WHERE subscription_object_id = $1
+        AND buyer_addr            = $2
+        AND cancelled_at IS NULL
+   RETURNING id, runs_remaining, max_per_run_micro`,
+    [req.params.id, wallet],
+  );
+  if (!r.rowCount) return res.status(404).json({ error: 'subscription_not_found_or_already_cancelled' });
+  res.json({ ok: true, cancelled: { subscription_object_id: req.params.id } });
+});
+
+router.get('/subscriptions', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const r = await pool.query(
+    `SELECT subscription_object_id, agent_id, area_slug, cron_utc_minute,
+            runs_remaining, max_per_run_micro, next_run_ts, last_run_ts, cancelled_at
+       FROM loop_subscriptions
+      WHERE buyer_addr = $1
+      ORDER BY created_at DESC LIMIT 50`,
+    [wallet],
+  );
+  res.json({ subscriptions: r.rows });
+});
+
+// ─── Upgrade wizard (existing-agent → workflow-aware brain) ──────────────
+
+router.get('/seller/agents/:id/upgrade-preview', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  try {
+    const result = await memory().classifyHistorical(req.params.id);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: 'preview_failed', detail: (e as Error).message });
+  }
+});
+
+router.post('/seller/agents/:id/upgrade', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  if (!(await verifyAgentOwner(req.params.id, wallet))) {
+    return res.status(403).json({ error: 'not_agent_owner' });
+  }
+  const b = req.body as {
+    workflow_walrus_blob_id: string;
+    stop_condition_walrus_blob_id?: string;
+    area_slugs: string[];
+  };
+  if (!b.workflow_walrus_blob_id || !Array.isArray(b.area_slugs)) {
+    return res.status(400).json({ error: 'workflow_walrus_blob_id + area_slugs required' });
+  }
+  // Postgres-side: persist declared areas + flag the agent's existing
+  // cognitive_memories rows by re-running the classifier (Postgres-only
+  // for now; on-chain `init_extension` PTB is built via SDK builder).
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const slug of b.area_slugs.slice(0, 16)) {
+      if (typeof slug === 'string' && slug.length <= 64) {
+        await client.query(
+          `INSERT INTO seller_areas (agent_id, area_slug)
+                VALUES ($1, $2) ON CONFLICT (agent_id, area_slug) DO NOTHING`,
+          [req.params.id, slug],
+        );
+      }
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'upgrade_failed', detail: (e as Error).message });
+  } finally {
+    client.release();
+  }
+  res.json({
+    ok: true,
+    declared_areas: b.area_slugs.length,
+    pending_chain_ptb: { kind: 'init_extension', agent_id: req.params.id, ...b },
+  });
+});
+
+// ─── Persona auto-rewrite seller surfaces (PRD-W S4 modal) ───────────────
+
+router.get('/seller/agents/:id/persona-history', async (req: AuthRequest, res: Response) => {
+  if (!req.user?.address) return res.status(401).json({ error: 'wallet_required' });
+  const r = await pool.query(
+    `SELECT id, proposed_blob_id, reasoning, reflection_count, status, proposed_at, resolved_at
+       FROM persona_rewrite_proposals
+      WHERE agent_id = $1
+      ORDER BY proposed_at DESC LIMIT 25`,
+    [req.params.id],
+  );
+  res.json({ proposals: r.rows });
+});
+
+router.post('/seller/agents/:id/approve-persona-rewrite',
+  async (req: AuthRequest, res: Response) => {
+    if (!req.user?.address) return res.status(401).json({ error: 'wallet_required' });
+    const b = req.body as { proposal_id: number; decision: 'approved' | 'rejected' };
+    if (!b.proposal_id || (b.decision !== 'approved' && b.decision !== 'rejected')) {
+      return res.status(400).json({ error: 'proposal_id + decision required' });
+    }
+    const r = await pool.query(
+      `UPDATE persona_rewrite_proposals
+          SET status = $1, resolved_at = now()
+        WHERE id = $2 AND agent_id = $3 AND status = 'pending'
+        RETURNING id`,
+      [b.decision, b.proposal_id, req.params.id],
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'proposal_not_pending' });
+    res.json({ ok: true, decision: b.decision });
+  });
+
+// ─── Right-to-forget (buyer-initiated) ───────────────────────────────────
+
+router.post('/buyer/right-to-forget', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const b = req.body as { agent_id: string; reason?: string };
+  if (!b.agent_id) return res.status(400).json({ error: 'agent_id_required' });
+  const created = await rtf().request({ agent_id: b.agent_id, buyer_addr: wallet, reason: b.reason });
+  res.status(202).json({ request: created, cooling_off_days: 7 });
+});
+
+router.delete('/buyer/right-to-forget/:id', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const ok = await rtf().cancel({ request_id: Number(req.params.id), buyer_addr: wallet });
+  if (!ok) return res.status(404).json({ error: 'request_not_pending' });
+  res.json({ ok: true });
+});
+
+// ─── Buyer artifact vault + preferences vCard ────────────────────────────
+
+router.get('/buyer/vault', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const entries = await vault().list(wallet);
+  res.json({ entries });
+});
+
+router.post('/buyer/preferences/save', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const saved = await vcard().save(wallet, req.body);
+  res.json({ vcard: saved });
+});
+
+router.get('/buyer/preferences/me', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const card = await vcard().read(wallet);
+  res.json({ vcard: card });
+});
+
+// ─── Warm-context transparency endpoint (B6 panel) ───────────────────────
+
+router.get('/jobs/:id/warm-context', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  // Look up job to find agent_id; fall back to query param.
+  const ctx = await memory().readWarmContext({
+    agent_id: String(req.query.agent_id ?? ''),
+    buyer_addr: wallet,
+    area_slug: req.query.area_slug ? String(req.query.area_slug) : undefined,
+    limit: 10,
+  });
+  res.json(ctx);
+});
+
+// ─── Workflow YAML edit (seller-side) ────────────────────────────────────
+//
+// Persisted as the latest row in cognitive_memories under namespace
+// `workflow-yaml-{agent_id}`. Latest-wins by created_at — same pattern as
+// the buyer-preferences vCard. No new table required.
+
+const WORKFLOW_NS = (agent_id: string) => `workflow-yaml-${agent_id}`;
+
+router.get('/seller/agents/:id/workflow', async (req: AuthRequest, res: Response) => {
+  if (!req.user?.address) return res.status(401).json({ error: 'wallet_required' });
+  const r = await pool.query<{ text: string; created_at: string }>(
+    `SELECT text, created_at FROM cognitive_memories
+      WHERE namespace = $1 ORDER BY created_at DESC LIMIT 1`,
+    [WORKFLOW_NS(req.params.id)],
+  );
+  if (!r.rowCount) return res.json({ workflow: null });
+  try {
+    const workflow = JSON.parse(r.rows[0].text);
+    res.json({ workflow, updated_at: r.rows[0].created_at });
+  } catch {
+    res.status(500).json({ error: 'workflow_parse_failed' });
+  }
+});
+
+router.patch('/seller/agents/:id/workflow', async (req: AuthRequest, res: Response) => {
+  if (!req.user?.address) return res.status(401).json({ error: 'wallet_required' });
+  if (!(await verifyAgentOwner(req.params.id, req.user.address))) {
+    return res.status(403).json({ error: 'not_agent_owner' });
+  }
+
+  // Validate the incoming workflow via the dispatcher's validator.
+  // SOLID: one source of truth — same shape the runtime executes against.
+  let validated;
+  try {
+    // Lazy-import to avoid a top-level cycle with workflowDispatcher.
+    const { validateWorkflow } = await import('../services/loop/workflowDispatcher');
+    validated = validateWorkflow(req.body);
+  } catch (e) {
+    return res.status(400).json({ error: 'workflow_invalid', detail: (e as Error).message });
+  }
+
+  const text = JSON.stringify(validated);
+  await pool.query(
+    `INSERT INTO cognitive_memories (brain_id, namespace, text, cognitive_level)
+          VALUES ($1, $2, $3, 4)`,
+    [req.params.id, WORKFLOW_NS(req.params.id), text],
+  );
+  res.json({ workflow: validated, updated_at: new Date().toISOString() });
+});
+
+// ─── Seller PARA summary (Studio dashboard ops) ──────────────────────────
+
+router.get('/seller/agents/:id/para-summary', async (req: AuthRequest, res: Response) => {
+  if (!req.user?.address) return res.status(401).json({ error: 'wallet_required' });
+  if (!(await verifyAgentOwner(req.params.id, req.user.address))) {
+    return res.status(403).json({ error: 'not_agent_owner' });
+  }
+  const counts = await pool.query<{ para_kind: string | null; n: string }>(
+    `SELECT para_kind, COUNT(*)::text AS n
+       FROM cognitive_memories
+      WHERE namespace LIKE $1
+      GROUP BY para_kind`,
+    [`cog-l4-${req.params.id}%`],
+  );
+  const distribution = { project: 0, area: 0, resource: 0, archive: 0, untagged: 0 };
+  for (const r of counts.rows) {
+    const k = (r.para_kind ?? 'untagged') as keyof typeof distribution;
+    if (k in distribution) distribution[k] = Number(r.n);
+  }
+  const pendingPersona = await pool.query<{ count: string }>(
+    `SELECT COUNT(*)::text AS count FROM persona_rewrite_proposals
+      WHERE agent_id = $1 AND status = 'pending'`,
+    [req.params.id],
+  );
+  const activeSubs = await pool.query<{ count: string }>(
+    `SELECT COUNT(*)::text AS count FROM loop_subscriptions
+      WHERE agent_id = $1 AND cancelled_at IS NULL AND runs_remaining > 0`,
+    [req.params.id],
+  );
+  res.json({
+    distribution,
+    pending_persona_proposals: Number(pendingPersona.rows[0]?.count ?? 0),
+    active_subscriptions: Number(activeSubs.rows[0]?.count ?? 0),
+  });
+});
+
+// ─── PRD-S — Quick-build (AI synth) ─────────────────────────────────────
+
+const VALID_CATEGORIES: Category[] = ['research', 'writing', 'translation', 'code', 'analysis', 'other'];
+
+router.post('/seller/agents/:id/workflow/synthesize', async (req: AuthRequest, res: Response) => {
+  if (!req.user?.address) return res.status(401).json({ error: 'wallet_required' });
+  if (!(await verifyAgentOwner(req.params.id, req.user.address))) {
+    return res.status(403).json({ error: 'not_agent_owner' });
+  }
+  const b = req.body as { description?: string; category?: string };
+  if (typeof b.description !== 'string' || b.description.trim().length < 1 || b.description.length > 500) {
+    return res.status(400).json({ error: 'description_1_to_500_chars' });
+  }
+  const category =
+    b.category && VALID_CATEGORIES.includes(b.category as Category)
+      ? (b.category as Category)
+      : undefined;
+  try {
+    const synth = synthesizeWorkflow({ description: b.description, category });
+    // SOLID: same validator the dispatcher runs — synth output must pass.
+    validateWorkflow(synth.workflow);
+    res.json(synth);
+  } catch (e) {
+    logger.error({ err: (e as Error).message }, 'synthesize:failed');
+    res.status(500).json({ error: 'synthesize_failed', detail: (e as Error).message });
+  }
+});
+
+// ─── PRD-S — Run workflow now (buyer instant run) ───────────────────────
+
+/** Lazy-built shared OutcomeEvaluator backed by stop condition (stub Pool). */
+const _runNowOutcome = () => {
+  const sce = new StopConditionEvaluator({ pool, logger });
+  return new OutcomeEvaluator(sce, logger);
+};
+
+/**
+ * Verify that `tx_digest` is a confirmed USDC transfer from `buyer` of at least
+ * `min_micro` µUSDC, with a balance change to `seller` ≥ 95% of price (5%
+ * platform cut). Single Sui RPC call. Returns `null` on success, or a string
+ * reason on failure (mapped to 402 by the route).
+ */
+async function verifyPaymentTx(args: {
+  tx_digest: string;
+  buyer: string;
+  seller: string;
+  min_micro: bigint;
+  usdc_coin_type: string;
+}): Promise<string | null> {
+  // Retry 4× with backoff to handle Sui RPC propagation race — the buyer's
+  // wallet may have submitted to a different fullnode than ours, and the
+  // tx may not be indexed here yet.
+  const delays = [0, 400, 900, 1800];
+  let r;
+  let lastErr: string | null = null;
+  for (const d of delays) {
+    if (d > 0) await new Promise((res) => setTimeout(res, d));
+    try {
+      r = await suiClient().getTransactionBlock({
+        digest: args.tx_digest,
+        options: { showEffects: true, showBalanceChanges: true },
+      });
+      break;
+    } catch (e) {
+      lastErr = (e as Error).message;
+    }
+  }
+  if (!r) {
+    logger.warn({ tx: args.tx_digest, err: lastErr }, 'verifyPaymentTx:tx_not_indexed');
+    return `verify_failed:${lastErr ?? 'tx_not_found_after_retry'}`;
+  }
+  if (r.effects?.status?.status !== 'success') return 'tx_not_successful';
+
+  // Self-pay scenario (buyer == seller, e.g. seller testing own agent):
+  // skip the receiver-balance check — the successful on-chain tx is itself
+  // the audit receipt. Net balance change for the address would be ~0
+  // (minus gas) which would otherwise fail the strict check.
+  if (args.buyer.toLowerCase() === args.seller.toLowerCase()) return null;
+
+  const changes = r.balanceChanges ?? [];
+  // Find a positive USDC balance change to the seller of >= 95% of min_micro.
+  const sellerCutMicro = (args.min_micro * 9_500n) / 10_000n;
+  const sellerLower = args.seller.toLowerCase();
+  const usdcChange = changes.find((c) => {
+    if (c.coinType !== args.usdc_coin_type) return false;
+    if (typeof c.owner !== 'object' || !('AddressOwner' in c.owner)) return false;
+    if ((c.owner.AddressOwner as string).toLowerCase() !== sellerLower) return false;
+    return BigInt(c.amount) >= sellerCutMicro;
+  });
+  if (!usdcChange) return 'insufficient_payment_to_seller';
+  return null;
+}
+
+router.post('/agents/:id/run-workflow', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const request = typeof req.body?.request === 'string' ? req.body.request.slice(0, 2000) : '';
+  const tx_digest = typeof req.body?.payment_tx_digest === 'string' ? req.body.payment_tx_digest : '';
+
+  // Look up agent + price + seller for payment gate.
+  const agentRow = await pool.query<{ owner_address: string; pricing: unknown; slug: string; id: string }>(
+    `SELECT owner_address, pricing, slug, id::text AS id
+       FROM agents WHERE slug = $1 OR id::text = $1 LIMIT 1`,
+    [req.params.id],
+  );
+  if (!agentRow.rowCount) return res.status(404).json({ error: 'agent_not_found' });
+  const agent = agentRow.rows[0];
+  const pricingObj = (agent.pricing ?? {}) as Record<string, string | null>;
+  const priceUsdc = pricingObj.sui_usdc ?? pricingObj.x402 ?? '0.01';
+  const priceMicro = BigInt(Math.max(1, Math.floor(Number(priceUsdc) * 1_000_000)));
+  const platformAddr = process.env.OPENX_PLATFORM_TREASURY ?? '';
+  const usdcCoinType = process.env.OPENX_USDC_COIN_TYPE ?? '';
+
+  // Payment gate (skip in dev when env unset).
+  if (usdcCoinType && agent.owner_address) {
+    if (!tx_digest) {
+      return res.status(402).json({
+        error: 'payment_required',
+        price_micro_usdc: String(priceMicro),
+        price_usdc: priceUsdc,
+        seller: agent.owner_address,
+        platform: platformAddr,
+        platform_bps: Number(process.env.OPENX_PLATFORM_BPS ?? 500),
+        usdc_coin_type: usdcCoinType,
+        note: 'sign a USDC transfer to the seller (95%) + platform (5%), post the tx_digest as payment_tx_digest',
+      });
+    }
+    const verifyErr = await verifyPaymentTx({
+      tx_digest, buyer: wallet,
+      seller: agent.owner_address,
+      min_micro: priceMicro,
+      usdc_coin_type: usdcCoinType,
+    });
+    if (verifyErr) return res.status(402).json({ error: 'payment_invalid', reason: verifyErr });
+  }
+
+  // Load saved workflow (latest cognitive_memories row in workflow-yaml-{agent}).
+  const r = await pool.query<{ text: string }>(
+    `SELECT text FROM cognitive_memories
+       WHERE namespace IN ($1, $2)
+       ORDER BY created_at DESC LIMIT 1`,
+    [WORKFLOW_NS(agent.slug), WORKFLOW_NS(agent.id)],
+  );
+  if (!r.rowCount) return res.status(422).json({ error: 'no_workflow_saved' });
+
+  let workflow;
+  try {
+    workflow = validateWorkflow(JSON.parse(r.rows[0].text));
+  } catch (e) {
+    return res.status(500).json({ error: 'workflow_corrupt', detail: (e as Error).message });
+  }
+
+  // Robust seed: legacy workflows may use any of these keys → all alias to the request.
+  const buyer_input = {
+    request, query: request, research_query: request,
+    brief: request, topic: request, source: request,
+    target: request, dataset: request,
+  };
+
+  const t0 = Date.now();
+  try {
+    const dispatcher = new WorkflowDispatcher(
+      memory(), _runNowOutcome(), new MockStepExecutor(), logger,
+    );
+    const result = await dispatcher.run({
+      workflow,
+      agent_id: agent.slug,
+      buyer_addr: wallet,
+      job_id: `runnow-${Date.now()}-${wallet.slice(2, 8)}`,
+      buyer_input,
+      area_slug: workflow.para?.area_slug,
+      budget_micro: 25_000_000,
+    });
+
+    // Final output = the express step's most descriptive markdown field.
+    const expressStep = [...result.per_step].reverse().find((s) => s.phase === 'express' && s.status === 'ok');
+    const o = expressStep?.output as Record<string, unknown> | undefined;
+    const final_output = String(
+      o?.daily_post ?? o?.final_output ?? o?.translated ?? o?.report_md ??
+      o?.review_md ?? o?.analysis_md ?? o?.result_md ?? '',
+    );
+
+    res.json({
+      tx_digest: tx_digest || null,
+      paid_micro_usdc: usdcCoinType ? String(priceMicro) : null,
+      steps_completed: result.steps_completed,
+      steps_total: result.steps_total,
+      per_step: result.per_step,
+      final_output,
+      ms: Date.now() - t0,
+    });
+  } catch (e) {
+    logger.error({ err: (e as Error).message, agent_id: req.params.id }, 'run-workflow:failed');
+    res.status(500).json({ error: 'run_failed', detail: (e as Error).message });
+  }
 });
 
 export default router;

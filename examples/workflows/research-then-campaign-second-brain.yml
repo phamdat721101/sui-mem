@@ -1,0 +1,90 @@
+# research-then-campaign-second-brain.yml
+#
+# PRD-W v1.1 FINAL §"Decision 5" — locked Day-1 worked-example workflow.
+# Demonstrates the full CAPTURE → ORGANIZE → DISTILL → EXPRESS shape with
+# PARA tagging, warm-context recall and a Distill-phase buyer checkpoint.
+#
+# Buyer flow: research a topic → organize findings → distill into a report
+# (buyer reviews) → express as platform-ready content pieces → settle.
+version: "v1.1"
+name: "research-then-campaign-second-brain"
+
+# Optional PARA defaults — workflow steps inherit unless they override.
+para:
+  default_kind: project
+  area_slug: vietnam-ev-content
+
+steps:
+  - id: research
+    capability: research
+    phase: capture
+    depends_on: []
+    inputs:
+      query: "{{ buyer.input.research_query }}"
+      area_slug: "{{ buyer.input.area_slug }}"
+      warm_context: "{{ memory.recall.area }}"
+    output_schema:
+      findings: "string[]"
+      sources: "url[]"
+    on_failure: retry-once
+    max_micro_usdc: 8000000   # $8 cap
+    risk_tier: medium
+
+  - id: organize
+    capability: organize
+    phase: organize
+    depends_on: [research]
+    inputs:
+      findings: "{{ steps.research.output.findings }}"
+      sources: "{{ steps.research.output.sources }}"
+    output_schema:
+      outline: "string"
+      key_insights: "string[]"
+    on_failure: halt
+    max_micro_usdc: 5000000
+    risk_tier: low
+
+  - id: distill
+    capability: distill
+    phase: distill
+    depends_on: [organize]
+    inputs:
+      outline: "{{ steps.organize.output.outline }}"
+      insights: "{{ steps.organize.output.key_insights }}"
+    output_schema:
+      report_md: "markdown"
+      diagram_mermaid: "mermaid"
+    on_failure: halt
+    max_micro_usdc: 12000000  # $12 cap
+    risk_tier: high            # always human-checkpoint at distill
+
+  - id: express
+    capability: express
+    phase: express
+    depends_on: [distill]
+    inputs:
+      report_md: "{{ steps.distill.output.report_md }}"
+      platforms: "{{ buyer.input.platforms }}"
+      tone_template: "{{ buyer.input.tone_template_walrus_blob_id }}"
+    output_schema:
+      content_pieces: "object[]"
+      content_ready: "bool"
+    on_failure: continue-skip
+    max_micro_usdc: 17000000  # $17 cap (largest budget — multi-platform output)
+    risk_tier: medium
+
+# Outcome predicate (typed AST — evaluated by stopConditionEvaluator).
+# Settles "full" when express step published + report exists.
+stop_condition:
+  type: deterministic
+  expr:
+    kind: and
+    children:
+      - kind: compare
+        op: ">="
+        left: { kind: var, name: steps_completed }
+        right: { kind: literal, value: 3 }
+      - kind: compare
+        op: ">"
+        left: { kind: var, name: spent_micro }
+        right: { kind: literal, value: 0 }

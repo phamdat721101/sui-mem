@@ -105,11 +105,18 @@ function Studio({ wallet }: { wallet: string }) {
                     <Link href={`/studio/agent/${a.slug}/train`} className="font-mono text-[11px] text-secondary hover:underline">
                       train ↗
                     </Link>
+                    <Link href={`/agent/${a.slug}/workflow`} className="font-mono text-[11px] text-secondary hover:underline">
+                      workflow ↗
+                    </Link>
+                    <Link href={`/agent/${a.slug}/upgrade`} className="font-mono text-[11px] text-secondary hover:underline">
+                      upgrade ↗
+                    </Link>
                     <Link href={`/agent/${a.slug}`} className="font-mono text-[11px] text-primary">
                       view ↗
                     </Link>
                   </div>
                 </div>
+                <ParaSummaryChip agentSlug={a.slug} />
               </li>
             ))}
           </ul>
@@ -140,6 +147,60 @@ function ConnectGate() {
       <p className="mt-3 font-mono text-[11px] uppercase tracking-widest text-outline">
         Use the Connect Sui button in the top bar.
       </p>
+    </div>
+  );
+}
+
+
+// ─── PARA summary chip — surfaces the agent's brain shape inline (PRD-W v1.1) ──
+
+interface ParaSummary {
+  distribution: { project: number; area: number; resource: number; archive: number; untagged: number };
+  pending_persona_proposals: number;
+  active_subscriptions: number;
+}
+
+function ParaSummaryChip({ agentSlug }: { agentSlug: string }) {
+  const account = useCurrentAccount();
+  const [s, setS] = useState<ParaSummary | null>(null);
+
+  useEffect(() => {
+    if (!account?.address) return;
+    let cancelled = false;
+    fetch(
+      `${process.env.NEXT_PUBLIC_AGENT_BACKEND_URL ?? 'http://localhost:3001'}/v3/loop/seller/agents/${encodeURIComponent(agentSlug)}/para-summary`,
+      { headers: { 'x-wallet-address': account.address }, cache: 'no-store' },
+    )
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => { if (!cancelled && j) setS(j as ParaSummary); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [account?.address, agentSlug]);
+
+  if (!s) return null;
+  const total = s.distribution.project + s.distribution.area + s.distribution.resource + s.distribution.archive + s.distribution.untagged;
+  if (total === 0 && s.pending_persona_proposals === 0 && s.active_subscriptions === 0) return null;
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-outline-variant/20 pt-2 text-[10px] font-mono">
+      {total > 0 && (
+        <>
+          <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-blue-300">{s.distribution.project} project</span>
+          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-amber-300">{s.distribution.area} area</span>
+          <span className="rounded bg-purple-500/15 px-1.5 py-0.5 text-purple-300">{s.distribution.resource} resource</span>
+          <span className="rounded bg-on-surface-variant/15 px-1.5 py-0.5 text-on-surface-variant">{s.distribution.archive} archive</span>
+        </>
+      )}
+      {s.pending_persona_proposals > 0 && (
+        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-emerald-300">
+          {s.pending_persona_proposals} pending persona ✎
+        </span>
+      )}
+      {s.active_subscriptions > 0 && (
+        <span className="rounded bg-secondary/15 px-1.5 py-0.5 text-secondary">
+          {s.active_subscriptions} active subs
+        </span>
+      )}
     </div>
   );
 }
