@@ -162,4 +162,224 @@ module fhe_brain::openx_loop_agent_registry_tests {
         ts::return_shared(agent);
         ts::end(scn);
     }
+
+    // ─── New v2 entry fns: publish_with_fee + mutations + attest + admin ────
+
+    use sui::coin;
+    use sui::sui::SUI; // generic test currency — Coin<SUI> stands in for Coin<USDC>
+
+    const ADMIN: address = @0xAD;
+    const FEE: u64 = 1_000_000;
+    const BAD_FEE: u64 = 500_000;
+
+    fun publish_with_fee_default(
+        scn: &mut ts::Scenario,
+        registry: &fhe_brain::openx_loop_agent_registry::BedrockModelRegistry,
+        fee: u64,
+        model_id: vector<u8>,
+    ) {
+        let ctx = ts::ctx(scn);
+        let mut clk = clock::create_for_testing(ctx);
+        clock::set_for_testing(&mut clk, 2_000_000);
+        let fee_coin = coin::mint_for_testing<SUI>(fee, ctx);
+        ar::publish_agent_with_fee<SUI>(
+            registry, fee_coin, ADMIN,
+            b"walrus_blob_manifest_v2",
+            b"phala-tee",
+            model_id,
+            10_000, 50_000, 10,
+            7000, 2500, 500,
+            &clk, ctx,
+        );
+        clock::destroy_for_testing(clk);
+    }
+
+    #[test]
+    fun publish_with_fee_succeeds_when_whitelisted() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, SELLER);
+        let agent = ts::take_shared<Agent>(&scn);
+        assert!(ar::seller(&agent) == SELLER, 900);
+        assert!(!ar::is_revoked(&agent), 901);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test, expected_failure(abort_code = 7, location = ar)]
+    fun publish_with_fee_rejects_below_minimum() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        publish_with_fee_default(&mut scn, &registry, BAD_FEE, b"claude-opus-4.6");
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test, expected_failure(abort_code = 9, location = ar)]
+    fun publish_with_fee_rejects_unwhitelisted_model() {
+        let mut scn = ts::begin(SELLER);
+        let registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        // Whitelist NOT populated for "claude-opus-4.6"
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test]
+    fun update_pricing_succeeds_for_seller() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, SELLER);
+        let mut agent = ts::take_shared<Agent>(&scn);
+        let mut clk = clock::create_for_testing(ts::ctx(&mut scn));
+        clock::set_for_testing(&mut clk, 3_000_000);
+        ar::update_pricing(&mut agent, 20_000, 100_000, 20, &clk, ts::ctx(&mut scn));
+        assert!(ar::per_iter_default(&agent) == 100_000, 1000);
+        assert!(ar::max_iter(&agent) == 20, 1001);
+        clock::destroy_for_testing(clk);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test, expected_failure(abort_code = 0, location = ar)]
+    fun update_pricing_rejects_non_seller() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, BUYER); // not seller
+        let mut agent = ts::take_shared<Agent>(&scn);
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::update_pricing(&mut agent, 20_000, 100_000, 20, &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test]
+    fun update_model_succeeds_when_whitelisted() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        ar::whitelist_for_testing(&mut registry, b"sonnet-4.5");
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, SELLER);
+        let mut agent = ts::take_shared<Agent>(&scn);
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::update_model(&mut agent, &registry, b"sonnet-4.5", &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test, expected_failure(abort_code = 9, location = ar)]
+    fun update_model_rejects_unwhitelisted() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, SELLER);
+        let mut agent = ts::take_shared<Agent>(&scn);
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::update_model(&mut agent, &registry, b"unknown-model", &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test]
+    fun update_manifest_succeeds_with_hash() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, SELLER);
+        let mut agent = ts::take_shared<Agent>(&scn);
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::update_manifest(&mut agent, b"new_blob_id_v2", b"sha256_bytes_32_long____________", &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test]
+    fun attest_manifest_hash_emits_event() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, SELLER);
+        let mut agent = ts::take_shared<Agent>(&scn);
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::attest_manifest_hash(&mut agent, b"sha256_bytes_32_long____________", &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test, expected_failure(abort_code = 5, location = ar)]
+    fun update_pricing_rejected_after_revoke() {
+        let mut scn = ts::begin(SELLER);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        ar::whitelist_for_testing(&mut registry, b"claude-opus-4.6");
+        publish_with_fee_default(&mut scn, &registry, FEE, b"claude-opus-4.6");
+
+        ts::next_tx(&mut scn, SELLER);
+        let mut agent = ts::take_shared<Agent>(&scn);
+        ar::revoke_agent(&mut agent, ts::ctx(&mut scn));
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::update_pricing(&mut agent, 20_000, 100_000, 20, &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ts::return_shared(agent);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test]
+    fun admin_whitelist_add_and_remove_emits_events() {
+        let mut scn = ts::begin(ADMIN);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        let admin_cap = ar::mint_admin_cap_for_testing(ts::ctx(&mut scn));
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::admin_whitelist_model(&admin_cap, &mut registry, b"sonnet-4.5", &clk, ts::ctx(&mut scn));
+        ar::admin_remove_whitelist_model(&admin_cap, &mut registry, b"sonnet-4.5", &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ar::destroy_admin_cap_for_testing(admin_cap);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
+
+    #[test, expected_failure(abort_code = 10, location = ar)]
+    fun admin_whitelist_double_add_aborts() {
+        let mut scn = ts::begin(ADMIN);
+        let mut registry = ar::new_registry_for_testing(ts::ctx(&mut scn));
+        let admin_cap = ar::mint_admin_cap_for_testing(ts::ctx(&mut scn));
+        let clk = clock::create_for_testing(ts::ctx(&mut scn));
+        ar::admin_whitelist_model(&admin_cap, &mut registry, b"sonnet-4.5", &clk, ts::ctx(&mut scn));
+        ar::admin_whitelist_model(&admin_cap, &mut registry, b"sonnet-4.5", &clk, ts::ctx(&mut scn));
+        clock::destroy_for_testing(clk);
+        ar::destroy_admin_cap_for_testing(admin_cap);
+        ar::destroy_registry_for_testing(registry);
+        ts::end(scn);
+    }
 }

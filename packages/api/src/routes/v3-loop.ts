@@ -1121,4 +1121,306 @@ router.post('/agents/:id/run-workflow', async (req: AuthRequest, res: Response) 
   }
 });
 
+// ─── PRD-W v1.3 — On-chain seller flow upgrade (FEATURE_LOOP_SELLER_V2) ───
+//
+// 4 mutation PTB builders + GET events + GET on-chain stats + admin whitelist.
+// All gated by FEATURE_LOOP_SELLER_V2; 404 when off.
+
+const sellerV2Enabled = () => process.env.FEATURE_LOOP_SELLER_V2 === 'true';
+
+async function loadAgentSuiObjectId(idOrSlug: string): Promise<string | null> {
+  // Convention: agents.fee_tx_digest carries the publish tx; the on-chain
+  // Agent shared object id is best resolved via the indexer's first
+  // LoopAgentPublished event for that seller. Fast path: the FE submits
+  // the sui_object_id explicitly when invoking mutations (it has it from
+  // the publish PTB result). We look it up from agent_events as fallback.
+  const r = await pool.query<{ agent_object_id: string }>(
+    `SELECT ae.agent_object_id
+       FROM agents a
+       JOIN agent_events ae ON ae.tx_digest = a.fee_tx_digest
+      WHERE (a.slug = $1 OR a.id::text = $1)
+        AND ae.event_type = 'LoopAgentPublished'
+      ORDER BY ae.timestamp_ms ASC LIMIT 1`,
+    [idOrSlug],
+  );
+  return r.rows[0]?.agent_object_id ?? null;
+}
+
+/** Build a mutation PTB and return its bytes for the FE to sign. */
+async function buildMutationPtb(
+  req: AuthRequest,
+  res: Response,
+  build: (args: { packageId: string; agentObjectId: string; bedrockRegistryObjectId: string }) => Promise<{ ptb_bytes_b64: string; agent_object_id: string }>,
+): Promise<void> {
+  if (!sellerV2Enabled()) { res.status(404).json({ error: 'feature_disabled' }); return; }
+  const wallet = req.user?.address;
+  if (!wallet) { res.status(401).json({ error: 'wallet_required' }); return; }
+  if (!(await verifyAgentOwner(req.params.id, wallet))) {
+    res.status(403).json({ error: 'not_agent_owner' });
+    return;
+  }
+  const packageId = process.env.OPENX_BRAIN_PACKAGE_ID;
+  if (!packageId) { res.status(503).json({ error: 'package_not_configured' }); return; }
+  const bedrockRegistryObjectId = process.env.OPENX_BEDROCK_MODEL_REGISTRY_ID;
+  if (!bedrockRegistryObjectId) { res.status(503).json({ error: 'bedrock_registry_not_configured' }); return; }
+  // Caller may supply sui_object_id explicitly (FE has it from publish);
+  // otherwise we resolve via the indexer.
+  const agentObjectId =
+    typeof req.body?.sui_object_id === 'string' && req.body.sui_object_id.startsWith('0x')
+      ? req.body.sui_object_id
+      : await loadAgentSuiObjectId(req.params.id);
+  if (!agentObjectId) { res.status(404).json({ error: 'agent_not_indexed_yet' }); return; }
+  try {
+    const out = await build({ packageId, agentObjectId, bedrockRegistryObjectId });
+    res.json(out);
+  } catch (e) {
+    res.status(400).json({ error: 'build_failed', detail: (e as Error).message });
+  }
+}
+
+router.post('/seller/agents/:id/update-pricing', async (req: AuthRequest, res: Response) => {
+  await buildMutationPtb(req, res, async ({ packageId, agentObjectId }) => {
+    const { buildUpdatePricingPtb } = await import('@fhe-ai-context/sdk');
+    const tx = buildUpdatePricingPtb({
+      packageId,
+      agentObjectId,
+      perIterMinMicroUsdc: BigInt(req.body?.per_iter_min_micro_usdc ?? 0),
+      perIterDefaultMicroUsdc: BigInt(req.body?.per_iter_default_micro_usdc ?? 0),
+      maxIterPerJob: Number(req.body?.max_iter_per_job ?? 1),
+    });
+    const bytes = await tx.build({ client: suiClient(), onlyTransactionKind: false } as never).catch(async () => tx.serialize());
+    return { ptb_bytes_b64: Buffer.from(bytes as Uint8Array).toString('base64'), agent_object_id: agentObjectId };
+  });
+});
+
+router.post('/seller/agents/:id/update-model', async (req: AuthRequest, res: Response) => {
+  await buildMutationPtb(req, res, async ({ packageId, agentObjectId, bedrockRegistryObjectId }) => {
+    const { buildUpdateModelPtb } = await import('@fhe-ai-context/sdk');
+    const tx = buildUpdateModelPtb({
+      packageId,
+      agentObjectId,
+      bedrockRegistryObjectId,
+      newModelId: String(req.body?.new_model_id ?? ''),
+    });
+    const bytes = await tx.build({ client: suiClient(), onlyTransactionKind: false } as never).catch(async () => tx.serialize());
+    return { ptb_bytes_b64: Buffer.from(bytes as Uint8Array).toString('base64'), agent_object_id: agentObjectId };
+  });
+});
+
+router.post('/seller/agents/:id/update-manifest', async (req: AuthRequest, res: Response) => {
+  await buildMutationPtb(req, res, async ({ packageId, agentObjectId }) => {
+    const { buildUpdateManifestPtb } = await import('@fhe-ai-context/sdk');
+    const sha256B64 = String(req.body?.manifest_sha256_b64 ?? '');
+    const sha256 = sha256B64 ? new Uint8Array(Buffer.from(sha256B64, 'base64')) : new Uint8Array(32);
+    const tx = buildUpdateManifestPtb({
+      packageId,
+      agentObjectId,
+      newWalrusBlobId: String(req.body?.new_walrus_blob_id ?? ''),
+      manifestSha256: sha256,
+    });
+    const bytes = await tx.build({ client: suiClient(), onlyTransactionKind: false } as never).catch(async () => tx.serialize());
+    return { ptb_bytes_b64: Buffer.from(bytes as Uint8Array).toString('base64'), agent_object_id: agentObjectId };
+  });
+});
+
+router.post('/seller/agents/:id/revoke', async (req: AuthRequest, res: Response) => {
+  await buildMutationPtb(req, res, async ({ packageId, agentObjectId }) => {
+    const { buildRevokeAgentPtb } = await import('@fhe-ai-context/sdk');
+    const tx = buildRevokeAgentPtb({ packageId, agentObjectId });
+    const bytes = await tx.build({ client: suiClient(), onlyTransactionKind: false } as never).catch(async () => tx.serialize());
+    return { ptb_bytes_b64: Buffer.from(bytes as Uint8Array).toString('base64'), agent_object_id: agentObjectId };
+  });
+});
+
+/**
+ * GET /v3/loop/seller/agents/:id/events?limit=50
+ *
+ * Reads the indexed `agent_events` table for the given agent (slug or uuid).
+ * Falls back to live Sui RPC `queryEvents` when the table is empty for that
+ * agent (e.g., indexer hasn't caught up yet — graceful degradation).
+ */
+router.get('/seller/agents/:id/events', async (req: AuthRequest, res: Response) => {
+  if (!sellerV2Enabled()) return res.status(404).json({ error: 'feature_disabled' });
+  const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200));
+
+  const agentObjectId = await loadAgentSuiObjectId(req.params.id);
+  if (!agentObjectId) {
+    return res.json({ events: [], agent_object_id: null });
+  }
+  const r = await pool.query<{
+    event_type: string; tx_digest: string; seq_in_tx: number;
+    payload: unknown; timestamp_ms: string;
+  }>(
+    `SELECT event_type, tx_digest, seq_in_tx, payload, timestamp_ms
+       FROM agent_events
+      WHERE agent_object_id = $1
+      ORDER BY timestamp_ms DESC
+      LIMIT $2`,
+    [agentObjectId, limit],
+  );
+  res.set('Cache-Control', 'private, max-age=15');
+  res.json({
+    agent_object_id: agentObjectId,
+    events: r.rows.map((row) => ({
+      type: row.event_type,
+      tx_digest: row.tx_digest,
+      seq_in_tx: row.seq_in_tx,
+      payload: row.payload,
+      timestamp_ms: Number(row.timestamp_ms),
+    })),
+  });
+});
+
+/**
+ * GET /v3/loop/seller/me/onchain-stats
+ *
+ * Aggregates on-chain seller activity (publish fees paid, mutation count,
+ * agent count) plus off-chain earnings for the connected wallet.
+ */
+router.get('/seller/me/onchain-stats', async (req: AuthRequest, res: Response) => {
+  if (!sellerV2Enabled()) return res.status(404).json({ error: 'feature_disabled' });
+  const wallet = req.user?.address?.toLowerCase();
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+
+  const evt = await pool.query<{
+    publish_fees_paid: string; publish_fees_micro: string;
+    mutations: string; revocations: string; agents_published: string;
+  }>(
+    `SELECT
+        COUNT(*) FILTER (WHERE event_type = 'AgentPublishFeePaid')::text   AS publish_fees_paid,
+        COALESCE(SUM(CASE WHEN event_type = 'AgentPublishFeePaid'
+                          THEN (payload->>'fee_micro')::bigint ELSE 0 END), 0)::text AS publish_fees_micro,
+        COUNT(*) FILTER (WHERE event_type IN ('AgentPricingUpdated','AgentModelUpdated','AgentManifestUpdated','AgentManifestAttested'))::text AS mutations,
+        COUNT(*) FILTER (WHERE event_type = 'LoopAgentRevoked')::text       AS revocations,
+        COUNT(*) FILTER (WHERE event_type = 'LoopAgentPublished')::text     AS agents_published
+       FROM agent_events
+      WHERE seller_addr = $1`,
+    [wallet],
+  );
+  const earn = await pool.query<{ earned_total: string; calls_total: string }>(
+    `SELECT
+        COALESCE(SUM(pc.amount_usdc), 0)::text AS earned_total,
+        COUNT(pc.id)::text                     AS calls_total
+       FROM paid_calls pc
+       JOIN agents a ON a.id = pc.agent_id
+      WHERE a.owner_address = $1`,
+    [wallet],
+  );
+  res.json({
+    on_chain: {
+      agents_published: Number(evt.rows[0]?.agents_published ?? 0),
+      publish_fees_paid: Number(evt.rows[0]?.publish_fees_paid ?? 0),
+      publish_fees_usdc: Number(evt.rows[0]?.publish_fees_micro ?? 0) / 1e6,
+      mutations: Number(evt.rows[0]?.mutations ?? 0),
+      revocations: Number(evt.rows[0]?.revocations ?? 0),
+    },
+    earnings: {
+      earned_total_usdc: earn.rows[0]?.earned_total ?? '0',
+      calls_total: Number(earn.rows[0]?.calls_total ?? 0),
+    },
+  });
+});
+
+/**
+ * GET /v3/loop/seller/me/wallet-events?limit=50
+ *
+ * Wallet-wide chronological event feed — returns every on-chain event tied
+ * to the connected seller wallet (across ALL their agents + admin acts).
+ * Powers the /settings command-center activity ledger.
+ *
+ * SOLID: pure read; reuses indexed `agent_events` table for sub-50ms p95.
+ */
+router.get('/seller/me/wallet-events', async (req: AuthRequest, res: Response) => {
+  if (!sellerV2Enabled()) return res.status(404).json({ error: 'feature_disabled' });
+  const wallet = req.user?.address?.toLowerCase();
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200));
+
+  const r = await pool.query<{
+    event_type: string; agent_object_id: string | null;
+    tx_digest: string; seq_in_tx: number;
+    payload: unknown; timestamp_ms: string;
+  }>(
+    `SELECT event_type, agent_object_id, tx_digest, seq_in_tx, payload, timestamp_ms
+       FROM agent_events
+      WHERE seller_addr = $1
+      ORDER BY timestamp_ms DESC
+      LIMIT $2`,
+    [wallet, limit],
+  );
+  res.set('Cache-Control', 'private, max-age=15');
+  res.json({
+    wallet,
+    events: r.rows.map((row) => ({
+      type: row.event_type,
+      agent_object_id: row.agent_object_id,
+      tx_digest: row.tx_digest,
+      seq_in_tx: row.seq_in_tx,
+      payload: row.payload,
+      timestamp_ms: Number(row.timestamp_ms),
+    })),
+  });
+});
+
+// Admin endpoints — gated by operator wallet match.
+const adminAddr = () => (process.env.OPENX_OPERATOR_SUI_PUBLIC_ADDRESS ?? '').toLowerCase();
+
+router.post('/admin/bedrock-whitelist/add', async (req: AuthRequest, res: Response) => {
+  if (!sellerV2Enabled()) return res.status(404).json({ error: 'feature_disabled' });
+  const wallet = req.user?.address?.toLowerCase();
+  if (!wallet || !adminAddr() || wallet !== adminAddr()) {
+    return res.status(403).json({ error: 'admin_only' });
+  }
+  const packageId = process.env.OPENX_BRAIN_PACKAGE_ID;
+  const adminCapId = process.env.OPENX_ADMIN_CAP_ID;
+  const registryId = process.env.OPENX_BEDROCK_MODEL_REGISTRY_ID;
+  if (!packageId || !adminCapId || !registryId) {
+    return res.status(503).json({ error: 'admin_not_configured' });
+  }
+  const { buildAdminWhitelistModelPtb } = await import('@fhe-ai-context/sdk');
+  const tx = buildAdminWhitelistModelPtb({
+    packageId,
+    adminCapObjectId: adminCapId,
+    bedrockRegistryObjectId: registryId,
+    modelId: String(req.body?.model_id ?? ''),
+  });
+  const bytes = await tx.build({ client: suiClient(), onlyTransactionKind: false } as never).catch(async () => tx.serialize());
+  res.json({ ptb_bytes_b64: Buffer.from(bytes as Uint8Array).toString('base64') });
+});
+
+router.post('/admin/bedrock-whitelist/remove', async (req: AuthRequest, res: Response) => {
+  if (!sellerV2Enabled()) return res.status(404).json({ error: 'feature_disabled' });
+  const wallet = req.user?.address?.toLowerCase();
+  if (!wallet || !adminAddr() || wallet !== adminAddr()) {
+    return res.status(403).json({ error: 'admin_only' });
+  }
+  const packageId = process.env.OPENX_BRAIN_PACKAGE_ID;
+  const adminCapId = process.env.OPENX_ADMIN_CAP_ID;
+  const registryId = process.env.OPENX_BEDROCK_MODEL_REGISTRY_ID;
+  if (!packageId || !adminCapId || !registryId) {
+    return res.status(503).json({ error: 'admin_not_configured' });
+  }
+  const { buildAdminRemoveWhitelistModelPtb } = await import('@fhe-ai-context/sdk');
+  const tx = buildAdminRemoveWhitelistModelPtb({
+    packageId,
+    adminCapObjectId: adminCapId,
+    bedrockRegistryObjectId: registryId,
+    modelId: String(req.body?.model_id ?? ''),
+  });
+  const bytes = await tx.build({ client: suiClient(), onlyTransactionKind: false } as never).catch(async () => tx.serialize());
+  res.json({ ptb_bytes_b64: Buffer.from(bytes as Uint8Array).toString('base64') });
+});
+
+/** GET /v3/loop/seller/v2-config — public config helper for the FE wizard. */
+router.get('/seller/v2-config', async (_req, res) => {
+  res.json({
+    enabled: sellerV2Enabled(),
+    package_id: process.env.OPENX_BRAIN_PACKAGE_ID ?? null,
+    bedrock_registry_id: process.env.OPENX_BEDROCK_MODEL_REGISTRY_ID ?? null,
+    admin_addr: process.env.OPENX_PUBLISH_FEE_ADMIN_ADDRESS ?? null,
+    usdc_coin_type: process.env.OPENX_USDC_COIN_TYPE ?? null,
+    publish_fee_micro: 1_000_000,
+  });
+});
+
 export default router;

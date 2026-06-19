@@ -589,6 +589,98 @@ export const api = {
       wallet,
       body,
     ),
+
+  // ─── Seller v2: on-chain seller flow upgrade (FEATURE_LOOP_SELLER_V2) ──
+  getSellerV2Config: () =>
+    getJson<{
+      enabled: boolean;
+      package_id: string | null;
+      bedrock_registry_id: string | null;
+      admin_addr: string | null;
+      usdc_coin_type: string | null;
+      publish_fee_micro: number;
+    }>('/v3/loop/seller/v2-config'),
+
+  getSellerAgentEvents: (wallet: string, slugOrId: string, limit = 50) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/seller/agents/${encodeURIComponent(slugOrId)}/events?limit=${limit}`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (r.status === 404) return { agent_object_id: null, events: [] };
+      if (!r.ok) throw new Error(`events ${r.status}`);
+      return r.json() as Promise<{
+        agent_object_id: string | null;
+        events: Array<{
+          type: string; tx_digest: string; seq_in_tx: number;
+          payload: Record<string, unknown>; timestamp_ms: number;
+        }>;
+      }>;
+    }),
+
+  getSellerOnChainStats: (wallet: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/seller/me/onchain-stats`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (r.status === 404 || r.status === 401) {
+        return {
+          on_chain: { agents_published: 0, publish_fees_paid: 0, publish_fees_usdc: 0, mutations: 0, revocations: 0 },
+          earnings: { earned_total_usdc: '0', calls_total: 0 },
+        };
+      }
+      if (!r.ok) throw new Error(`onchain-stats ${r.status}`);
+      return r.json() as Promise<{
+        on_chain: { agents_published: number; publish_fees_paid: number; publish_fees_usdc: number; mutations: number; revocations: number };
+        earnings: { earned_total_usdc: string; calls_total: number };
+      }>;
+    }),
+
+  getSellerWalletEvents: (wallet: string, limit = 50) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/seller/me/wallet-events?limit=${limit}`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (r.status === 404 || r.status === 401) return { wallet, events: [] };
+      if (!r.ok) throw new Error(`wallet-events ${r.status}`);
+      return r.json() as Promise<{
+        wallet: string;
+        events: Array<{
+          type: string; agent_object_id: string | null;
+          tx_digest: string; seq_in_tx: number;
+          payload: Record<string, unknown>; timestamp_ms: number;
+        }>;
+      }>;
+    }),
+
+  buildUpdatePricing: (wallet: string, slugOrId: string, body: { sui_object_id?: string; per_iter_min_micro_usdc: number; per_iter_default_micro_usdc: number; max_iter_per_job: number }) =>
+    authedJson<{ ptb_bytes_b64: string; agent_object_id: string }>(
+      'POST', `/v3/loop/seller/agents/${encodeURIComponent(slugOrId)}/update-pricing`, wallet, body,
+    ),
+
+  buildUpdateModel: (wallet: string, slugOrId: string, body: { sui_object_id?: string; new_model_id: string }) =>
+    authedJson<{ ptb_bytes_b64: string; agent_object_id: string }>(
+      'POST', `/v3/loop/seller/agents/${encodeURIComponent(slugOrId)}/update-model`, wallet, body,
+    ),
+
+  buildUpdateManifest: (wallet: string, slugOrId: string, body: { sui_object_id?: string; new_walrus_blob_id: string; manifest_sha256_b64: string }) =>
+    authedJson<{ ptb_bytes_b64: string; agent_object_id: string }>(
+      'POST', `/v3/loop/seller/agents/${encodeURIComponent(slugOrId)}/update-manifest`, wallet, body,
+    ),
+
+  buildRevokeAgent: (wallet: string, slugOrId: string, body: { sui_object_id?: string }) =>
+    authedJson<{ ptb_bytes_b64: string; agent_object_id: string }>(
+      'POST', `/v3/loop/seller/agents/${encodeURIComponent(slugOrId)}/revoke`, wallet, body,
+    ),
+
+  adminWhitelistModel: (wallet: string, model_id: string) =>
+    authedJson<{ ptb_bytes_b64: string }>(
+      'POST', '/v3/loop/admin/bedrock-whitelist/add', wallet, { model_id },
+    ),
+
+  adminRemoveWhitelistModel: (wallet: string, model_id: string) =>
+    authedJson<{ ptb_bytes_b64: string }>(
+      'POST', '/v3/loop/admin/bedrock-whitelist/remove', wallet, { model_id },
+    ),
 };
 
 export type WorkflowStep = {

@@ -42,6 +42,7 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/agents\/[^/]+$/,
   /^\/jobs\/[^/]+$/,
   /^\/concierge\/search$/,
+  /^\/seller\/v2-config$/,
 ];
 
 export const auth = (req: AuthRequest, res: Response, next: NextFunction) => {

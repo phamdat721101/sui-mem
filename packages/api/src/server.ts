@@ -51,6 +51,8 @@ import {
   type DueSubscription,
 } from './services/loop/workflowScheduler';
 import { recordWorkflowRunSideEffects } from './services/loop/workflowRunRecorder';
+import { AgentEventIndexerCron } from './services/loop/agentEventIndexer';
+import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
 
 /**
  * OpenX API — Sui-native after the EVM/Fhenix pivot.
@@ -290,6 +292,13 @@ const crons: ScheduledCron[] = [
     logger,
     enabled: () => process.env.FEATURE_LOOP_DAILY_RUN === 'true',
   }),
+  new AgentEventIndexerCron({
+    pool,
+    suiClient: new SuiClient({ url: process.env.SUI_RPC_URL ?? getFullnodeUrl('testnet') }),
+    packageId: () => process.env.OPENX_BRAIN_PACKAGE_ID,
+    logger,
+    enabled: () => process.env.FEATURE_LOOP_SELLER_V2 === 'true',
+  }),
 ];
 
 let lastTickMinute = -1;
@@ -299,11 +308,11 @@ const cronTimer = setInterval(async () => {
   if (minute === lastTickMinute) return;
   lastTickMinute = minute;
   for (const c of crons) {
-    // The workflow scheduler is special: its docstring says it fires every
-    // minute and self-filters subscriptions by next_run_ts. All other crons
-    // fire only at their specific utc_minute-of-day.
-    const isScheduler = c.name === 'workflowScheduler';
-    if (!isScheduler && c.utc_minute !== minute) continue;
+    // Some crons fire every minute and self-filter internally (workflow
+    // scheduler reads next_run_ts; event indexer pulls from a cursor).
+    // All other crons fire only at their specific utc_minute-of-day.
+    const everyMinute = c.name === 'workflowScheduler' || c.name === 'agentEventIndexer';
+    if (!everyMinute && c.utc_minute !== minute) continue;
     try {
       await c.tick(now);
     } catch (e) {

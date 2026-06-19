@@ -17,6 +17,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { isBedrockModelId } from '@fhe-ai-context/sui-sdk';
 import { pool } from '../db';
 
 export type Domain =
@@ -60,6 +61,11 @@ export interface SellerPublishInput {
   slug?: string;
   verification_tier?: Tier;
   seller_profile?: SellerProfileInput;
+  /** Bedrock model id — when present, MUST be in BEDROCK_MODEL_CATALOG. */
+  default_model_id?: string;
+  /** Sui tx digest of the on-chain $1 USDC publish-fee payment. Optional
+   *  for legacy publishes; required for v2 on-chain publishes. */
+  fee_tx_digest?: string;
 }
 
 export interface SellerPublishResult {
@@ -119,6 +125,12 @@ function validate(input: SellerPublishInput): void {
   }
   if (input.chain && !CHAINS.includes(input.chain)) {
     throw httpErr(`invalid chain (allowed: ${CHAINS.join(', ')})`, 400);
+  }
+  if (input.default_model_id && !isBedrockModelId(input.default_model_id)) {
+    throw httpErr(`bedrock_model_unsupported: ${input.default_model_id}`, 400);
+  }
+  if (input.fee_tx_digest !== undefined && typeof input.fee_tx_digest !== 'string') {
+    throw httpErr('fee_tx_digest must be a string', 400);
   }
 }
 
@@ -215,16 +227,16 @@ export async function publish(
       `INSERT INTO agents (
          brain_id, owner_address, chain, persona, pricing,
          published, slug, domain, short_description, verification_tier,
-         manifest_yaml, manifest_hash, seller_id
+         manifest_yaml, manifest_hash, seller_id, fee_tx_digest
        )
        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb,
                true, $6, $7, $8, $9,
-               $10, $11, $12)
+               $10, $11, $12, $13)
        RETURNING id`,
       [
         brainId, owner, chain, JSON.stringify(persona), JSON.stringify(pricing),
         slug, input.domain, input.short_description, tier,
-        manifestYaml, manifestHash, sellerId,
+        manifestYaml, manifestHash, sellerId, input.fee_tx_digest ?? null,
       ],
     );
     const agentId = agentRes.rows[0].id as string;
