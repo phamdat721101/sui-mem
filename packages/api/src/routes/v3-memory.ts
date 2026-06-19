@@ -885,4 +885,63 @@ function parseFloatSafe(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * GET /v3/memory/stats/agents/:agent_id — F6 reflexive-loop observability.
+ *
+ * Returns per-level write counts (last 24h), MemWal mirror flag status,
+ * and a snapshot of cron last-run timestamps. The endpoint is intentionally
+ * read-only and additive — it never mutates state.
+ *
+ * Public: no PII; no namespace contents leaked. Filtering is by agent_id.
+ */
+router.get('/stats/agents/:agent_id', async (req, res) => {
+  const agent_id = String(req.params.agent_id ?? '');
+  if (!agent_id) return res.status(400).json({ error: 'agent_id_required' });
+
+  const counts = await pool.query<{ level: number; n: string; per_buyer: boolean }>(
+    `SELECT cognitive_level AS level,
+            COUNT(*)::text  AS n,
+            (namespace ~ ('cog-l[0-9]-' || $1 || '-0x'))::bool AS per_buyer
+       FROM cognitive_memories
+      WHERE namespace LIKE ('cog-l%-' || $1 || '%')
+        AND created_at > now() - INTERVAL '24 hours'
+      GROUP BY cognitive_level, per_buyer`,
+    [agent_id],
+  );
+
+  const memory_levels = {
+    l2_count_24h: 0,
+    l3_count_24h: 0,
+    l4_agent_count_24h: 0,
+    l4_per_buyer_count_24h: 0,
+    l5_agent_count_24h: 0,
+    l5_per_buyer_count_24h: 0,
+  };
+  for (const row of counts.rows) {
+    const n = Number(row.n);
+    if (row.level === 2) memory_levels.l2_count_24h += n;
+    else if (row.level === 3) memory_levels.l3_count_24h += n;
+    else if (row.level === 4) {
+      if (row.per_buyer) memory_levels.l4_per_buyer_count_24h += n;
+      else memory_levels.l4_agent_count_24h += n;
+    } else if (row.level === 5) {
+      if (row.per_buyer) memory_levels.l5_per_buyer_count_24h += n;
+      else memory_levels.l5_agent_count_24h += n;
+    }
+  }
+
+  res.json({
+    agent_id,
+    memory_levels,
+    flags: {
+      memwal_peerdep_enabled: process.env.MEMWAL_PEERDEP_ENABLED === 'true',
+      mode_a_memory_enabled: process.env.FEATURE_LOOP_MODE_A_MEMORY === 'true',
+      persona_auto_rewrite_enabled: process.env.FEATURE_LOOP_W3_PERSONA_AUTO_REWRITE === 'true',
+      para_archival_enabled: process.env.FEATURE_LOOP_W3_PARA_ARCHIVAL === 'true',
+      weekly_digest_enabled: process.env.FEATURE_WEEKLY_DIGEST === 'true',
+    },
+    generated_at: new Date().toISOString(),
+  });
+});
+
 export default router;

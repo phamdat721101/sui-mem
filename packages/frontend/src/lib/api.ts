@@ -11,6 +11,41 @@
 export const AGENT_BACKEND_URL =
   process.env.NEXT_PUBLIC_AGENT_BACKEND_URL ?? 'http://localhost:3001';
 
+const WALRUS_AGGREGATOR =
+  process.env.NEXT_PUBLIC_WALRUS_AGGREGATOR_URL ?? 'https://aggregator.walrus-testnet.walrus.space';
+
+/** Synthetic `tx_hash` prefixes used by the backend for non-on-chain rows
+ *  (subscription cron forks, in-modal Run-Now demos). The FE must NEVER
+ *  construct an explorer URL for these — Suiscan will 404. */
+const SYNTHETIC_TX_PREFIXES = ['demo:', 'cron:', 'runnow:'];
+
+/** Sentinel blob ids the FE has staged before a real Walrus pin exists.
+ *  Treat as "no link" rather than rendering a 404 download. */
+const PLACEHOLDER_BLOB_PREFIXES = ['pending-', 'stub-'];
+
+/** True when the blob_id is a sentinel placeholder, not a real Walrus id. */
+export function isPlaceholderBlob(blob_id: string | null | undefined): boolean {
+  if (!blob_id) return true;
+  return PLACEHOLDER_BLOB_PREFIXES.some((p) => blob_id.startsWith(p));
+}
+
+/** Build a public Walrus aggregator URL, or null if the blob is a placeholder.
+ *  Walrus testnet aggregator path is `/v1/blobs/{id}` — NOT `/v1/{id}`. */
+export function walrusViewUrl(blob_id: string | null | undefined): string | null {
+  if (isPlaceholderBlob(blob_id)) return null;
+  return `${WALRUS_AGGREGATOR}/v1/blobs/${blob_id}`;
+}
+
+/** Build a Suiscan tx URL, or null when the tx_hash is synthetic (cron forks,
+ *  Run-Now demos) or the network isn't a real Sui network. */
+export function explorerTxUrl(network: string | null | undefined, tx_hash: string | null | undefined): string | null {
+  if (!tx_hash || !network) return null;
+  if (SYNTHETIC_TX_PREFIXES.some((p) => tx_hash.startsWith(p))) return null;
+  if (network === 'sui-testnet') return `https://suiscan.xyz/testnet/tx/${tx_hash}`;
+  if (network === 'sui-mainnet') return `https://suiscan.xyz/mainnet/tx/${tx_hash}`;
+  return null;
+}
+
 /** A row from `GET /v3/marketplace/listings`. */
 export interface Listing {
   id: string;
@@ -42,6 +77,34 @@ export interface MemWalBrain {
   cognitive_level: number;
   sovereignty_proof_url?: string;
   created_at: string;
+}
+
+/** A single artifact within a run group. */
+export interface RunArtifact {
+  job_id: string;
+  area_slug: string | null;
+  artifact_name: string;
+  walrus_blob_id: string;
+  mime_type: string;
+  created_at: string;
+}
+
+/** Per-run timeline status. Mirrors the BE view's CASE expression. */
+export type RunStatus = 'pending' | 'running' | 'success' | 'failed' | 'completed';
+
+/** A workflow run + its artifacts — the timeline UI's grouping unit. */
+export interface RunGroup {
+  job_id: string;
+  area_slug: string | null;
+  agent_id: string | null;
+  run_started_at: string | null;
+  run_completed_at: string | null;
+  outcome_satisfied: boolean | null;
+  total_cost_micro: number | null;
+  step_count: number | null;
+  workflow_walrus_blob_id: string | null;
+  run_status: RunStatus;
+  artifacts: RunArtifact[];
 }
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -424,6 +487,40 @@ export const api = {
         artifact_name: string; walrus_blob_id: string;
         mime_type: string; created_at: string;
       }>;
+    }>),
+
+  // ─── PRD-W v1.2: per-run timeline + bundle ZIP + digest ────────────
+  // SOLID: 3 thin helpers; the FE never hard-codes the URL shape.
+  listRuns: (wallet: string, opts: { sinceDays?: number; limit?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.sinceDays) params.set('sinceDays', String(opts.sinceDays));
+    if (opts.limit) params.set('limit', String(opts.limit));
+    const q = params.toString();
+    return fetch(
+      `${AGENT_BACKEND_URL}/v3/loop/runs/by-buyer/${encodeURIComponent(wallet)}${q ? `?${q}` : ''}`,
+      { headers: { 'x-wallet-address': wallet }, cache: 'no-store' },
+    ).then(async (r) => {
+      if (r.status === 404) return { runs: [] as RunGroup[] };
+      if (!r.ok) throw new Error(`listRuns ${r.status}`);
+      return r.json() as Promise<{ runs: RunGroup[] }>;
+    });
+  },
+
+  bundleUrl: (job_id: string) =>
+    `${AGENT_BACKEND_URL}/v3/loop/runs/${encodeURIComponent(job_id)}/bundle.zip`,
+
+  getDigest: (wallet: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/digests/by-buyer/${encodeURIComponent(wallet)}`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then((r) => r.json() as Promise<{
+      digest: {
+        week: string;
+        artifact_name: string;
+        walrus_blob_id: string;
+        mime_type: string;
+        created_at: string;
+      } | null;
     }>),
 
   // Seller workflow YAML — view + edit (PRD-W v1.1 seller surface).

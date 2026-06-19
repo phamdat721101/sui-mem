@@ -31,6 +31,28 @@ export interface VaultEntry {
   created_at: string;
 }
 
+/** A single workflow run grouped with its artifacts — the timeline unit. */
+export interface RunGroup {
+  job_id: string;
+  area_slug: string | null;
+  agent_id: string | null;
+  run_started_at: string | null;
+  run_completed_at: string | null;
+  outcome_satisfied: boolean | null;
+  total_cost_micro: number | null;
+  step_count: number | null;
+  workflow_walrus_blob_id: string | null;
+  run_status: 'pending' | 'running' | 'success' | 'failed' | 'completed';
+  artifacts: VaultEntry[];
+}
+
+export interface ListByRunOpts {
+  /** Window in days (default 30, max 365). */
+  sinceDays?: number;
+  /** Max runs returned (default 50, max 200). */
+  limit?: number;
+}
+
 export interface VaultDeps {
   pool: Pool;
   mirror: MemWalMirror;
@@ -113,5 +135,72 @@ export class ArtifactVaultService {
       }
     }
     return out;
+  }
+
+  /**
+   * Group artifacts by run (`job_id`) sorted by run start DESC. Reads from
+   * the `workflow_run_artifacts` view (migration 035) which left-joins the
+   * vault manifests with `workflow_runs` for status + cost + step_count.
+   *
+   * One SQL query, in-memory grouping. Single round-trip.
+   */
+  async listByRun(buyer_addr: string, opts: ListByRunOpts = {}): Promise<{ runs: RunGroup[] }> {
+    const namespace = artifactVaultNamespace(buyer_addr);
+    const sinceDays = Math.max(1, Math.min(opts.sinceDays ?? 30, 365));
+    const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
+
+    const r = await this.deps.pool.query<{
+      job_id: string; area_slug: string | null; artifact_name: string;
+      walrus_blob_id: string; mime_type: string; size_bytes: number;
+      namespace: string; buyer_addr: string;
+      artifact_created_at: string;
+      run_started_at: string | null; run_completed_at: string | null;
+      outcome_satisfied: boolean | null;
+      total_cost_micro: string | null;  // bigint comes back as string
+      step_count: number | null;
+      workflow_walrus_blob_id: string | null;
+      agent_id: string | null;
+      run_status: RunGroup['run_status'];
+    }>(
+      `SELECT *
+         FROM workflow_run_artifacts
+        WHERE namespace = $1
+          AND artifact_created_at > now() - ($2 || ' days')::interval
+        ORDER BY artifact_created_at DESC`,
+      [namespace, String(sinceDays)],
+    );
+
+    const grouped = new Map<string, RunGroup>();
+    for (const row of r.rows) {
+      const job_id = row.job_id;
+      if (!job_id) continue;
+      let g = grouped.get(job_id);
+      if (!g) {
+        g = {
+          job_id,
+          area_slug: row.area_slug,
+          agent_id: row.agent_id,
+          run_started_at: row.run_started_at,
+          run_completed_at: row.run_completed_at,
+          outcome_satisfied: row.outcome_satisfied,
+          total_cost_micro: row.total_cost_micro != null ? Number(row.total_cost_micro) : null,
+          step_count: row.step_count,
+          workflow_walrus_blob_id: row.workflow_walrus_blob_id,
+          run_status: row.run_status,
+          artifacts: [],
+        };
+        grouped.set(job_id, g);
+      }
+      g.artifacts.push({
+        job_id: row.job_id,
+        area_slug: row.area_slug,
+        artifact_name: row.artifact_name,
+        walrus_blob_id: row.walrus_blob_id,
+        mime_type: row.mime_type,
+        created_at: row.artifact_created_at,
+      });
+    }
+
+    return { runs: [...grouped.values()].slice(0, limit) };
   }
 }

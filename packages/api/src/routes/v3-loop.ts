@@ -21,6 +21,7 @@
  */
 
 import { type Request, type Response } from 'express';
+import archiver from 'archiver';
 import { hardenedRouter } from '../lib/routerSafety';
 import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
@@ -56,6 +57,7 @@ import {
 } from '../services/loop/workflowDispatcher';
 import { OutcomeEvaluator } from '../services/loop/outcomeEvaluator';
 import { StopConditionEvaluator } from '../services/loop/stopConditionEvaluator';
+import { recordWorkflowRunSideEffects } from '../services/loop/workflowRunRecorder';
 
 const router = hardenedRouter();
 
@@ -144,6 +146,7 @@ router.post('/agents/:id/invoke', loopX402Middleware(), async (req: Request, res
     persona_system_prompt: String(req.body?.persona_system_prompt ?? 'You are a helpful AI agent.'),
     default_model_id: String(fields.default_model_id ?? 'claude-opus-4.6'),
     word_limit: typeof req.body?.word_limit === 'number' ? req.body.word_limit : 4000,
+    area_slug: typeof req.body?.area_slug === 'string' ? req.body.area_slug : null,
   };
 
   try {
@@ -161,6 +164,7 @@ router.post('/agents/:id/invoke', loopX402Middleware(), async (req: Request, res
         iv: req.body?.iv ? Buffer.from(String(req.body.iv), 'base64') : undefined,
       },
       correlationId: (req.headers['x-correlation-id'] as string) ?? settle.txDigest,
+      suiTxDigest: settle.txDigest,
     });
     res.json({
       tx_digest: settle.txDigest,
@@ -365,6 +369,19 @@ const memory = () =>
   (_memory ??= new MemoryService({ pool, mirror: noopMirror, logger }));
 const vault = () =>
   (_vault ??= new ArtifactVaultService({ pool, mirror: noopMirror, logger }));
+
+/** Lazy Walrus uploader singleton — created once, reused across requests. */
+let _walrus: { upload: (b: Uint8Array) => Promise<{ blobs: Array<{ blobId: string }> }> } | null = null;
+const lazyWalrus = () => {
+  if (_walrus) return _walrus;
+  _walrus = {
+    upload: async (bytes: Uint8Array) => {
+      const { createWalrusStore } = await import('@fhe-ai-context/sui-sdk');
+      return createWalrusStore().upload(bytes);
+    },
+  };
+  return _walrus;
+};
 const vcard = () =>
   (_vcard ??= new BuyerPreferenceProfileService({ pool, mirror: noopMirror, logger }));
 const rtf = () =>
@@ -594,6 +611,180 @@ router.get('/buyer/vault', async (req: AuthRequest, res: Response) => {
   if (!wallet) return res.status(401).json({ error: 'wallet_required' });
   const entries = await vault().list(wallet);
   res.json({ entries });
+});
+
+// ─── PRD-W v1.2 — per-run timeline + bundle ZIP + digest ─────────────────
+//
+// The vault endpoint above stays for legacy clients. The 3 endpoints below
+// power the new `/activity` Run Timeline panel + Run Detail Drawer + Weekly
+// Digest card. Master flag: `FEATURE_LOOP_RUN_TIMELINE`.
+
+const runTimelineEnabled = () => process.env.FEATURE_LOOP_RUN_TIMELINE === 'true';
+const runBundleZipEnabled = () => process.env.FEATURE_LOOP_RUN_BUNDLE_ZIP === 'true';
+const weeklyDigestEnabled = () => process.env.FEATURE_WEEKLY_DIGEST === 'true';
+
+/**
+ * GET /v3/loop/runs/by-buyer/:wallet
+ *   ?sinceDays=30 (default 30, max 365)
+ *   ?limit=50     (default 50, max 200)
+ *
+ * Returns `{ runs: RunGroup[] }` — artifacts grouped by job_id, sorted
+ * DESC by run_started_at. Authz: x-wallet-address must match :wallet
+ * (case-insensitive). Cache: 30s private.
+ */
+router.get('/runs/by-buyer/:wallet', async (req: AuthRequest, res: Response) => {
+  if (!runTimelineEnabled()) return res.status(404).json({ error: 'feature_disabled' });
+  const wallet = String(req.params.wallet ?? '').toLowerCase();
+  const headerWallet = (req.user?.address ?? '').toLowerCase();
+  if (!wallet || !headerWallet) return res.status(401).json({ error: 'wallet_required' });
+  if (wallet !== headerWallet) return res.status(403).json({ error: 'wallet_mismatch' });
+
+  const sinceDays = Math.max(1, Math.min(Number(req.query.sinceDays ?? 30), 365));
+  const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200));
+  try {
+    const result = await vault().listByRun(wallet, { sinceDays, limit });
+    res.set('Cache-Control', 'private, max-age=30');
+    res.json(result);
+  } catch (e) {
+    logger.error({ err: (e as Error).message, wallet }, 'runs:listByRun_failed');
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+/**
+ * GET /v3/loop/runs/:job_id/bundle.zip
+ *
+ * Streams a ZIP of all artifacts for a run. Walrus fetches happen in
+ * parallel; partial failures land as `{name}.error.txt`. For Tier 4 E2EE
+ * artifacts (`*.encrypted` or `application/x-encrypted`), a brief
+ * `README-decryption.md` is appended.
+ *
+ * Authz: artifact namespace must equal `artifact-vault-{x-wallet-address}`.
+ */
+router.get('/runs/:job_id/bundle.zip', async (req: AuthRequest, res: Response) => {
+  if (!runTimelineEnabled() || !runBundleZipEnabled()) {
+    return res.status(404).json({ error: 'feature_disabled' });
+  }
+  const job_id = String(req.params.job_id ?? '');
+  const wallet = (req.user?.address ?? '').toLowerCase();
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  if (!job_id) return res.status(400).json({ error: 'job_id_required' });
+
+  const namespace = `artifact-vault-${wallet}`;
+
+  // Authz: this run must belong to the caller.
+  const auth = await pool.query(
+    `SELECT 1 FROM workflow_run_artifacts
+      WHERE job_id = $1 AND namespace = $2 LIMIT 1`,
+    [job_id, namespace],
+  );
+  if (!auth.rowCount) return res.status(403).json({ error: 'not_your_run' });
+
+  const arts = await pool.query<{
+    artifact_name: string; walrus_blob_id: string; mime_type: string; size_bytes: number;
+  }>(
+    `SELECT artifact_name, walrus_blob_id, mime_type, size_bytes
+       FROM workflow_run_artifacts
+      WHERE job_id = $1 AND namespace = $2
+      ORDER BY artifact_created_at ASC`,
+    [job_id, namespace],
+  );
+  if (!arts.rowCount) return res.status(404).json({ error: 'no_artifacts' });
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="run-${job_id}.zip"`);
+
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  archive.on('error', (err: Error) => {
+    logger.error({ err: err.message, job_id }, 'bundle:zip_error');
+    if (!res.headersSent) res.status(500).end();
+  });
+  archive.pipe(res);
+
+  // Lazy-import the Walrus client only when the route is hit.
+  const { createWalrusStore } = await import('@fhe-ai-context/sui-sdk');
+  const walrus = createWalrusStore();
+
+  const fetched = await Promise.all(
+    arts.rows.map(async (a) => {
+      try {
+        const bytes = await walrus.fetch(a.walrus_blob_id);
+        return { ok: true as const, name: a.artifact_name, bytes, mime_type: a.mime_type };
+      } catch (e) {
+        return { ok: false as const, name: a.artifact_name, err: (e as Error).message };
+      }
+    }),
+  );
+  let hasEncrypted = false;
+  for (const r of fetched) {
+    if (r.ok) {
+      archive.append(Buffer.from(r.bytes), { name: r.name });
+      if (r.name.endsWith('.encrypted') || r.mime_type === 'application/x-encrypted') {
+        hasEncrypted = true;
+      }
+    } else {
+      archive.append(`# Failed to fetch ${r.name}\nError: ${r.err}\n`, {
+        name: `${r.name}.error.txt`,
+      });
+    }
+  }
+  if (hasEncrypted) {
+    archive.append(README_DECRYPTION, { name: 'README-decryption.md' });
+  }
+  await archive.finalize();
+});
+
+const README_DECRYPTION = `# Decrypting Tier 4 (E2EE) artifacts
+
+Some files in this bundle are end-to-end encrypted. Only your wallet can derive
+the decryption key (Seal IBE threshold policy). The OpenX server can NEVER
+decrypt these files — that is the sovereignty guarantee.
+
+To decrypt:
+1. Open https://openx.so/activity in the browser where your Sui wallet is
+   connected (Slush / Suiet / OKX-Sui).
+2. Click the run that produced these artifacts → "Decrypt with wallet".
+3. Or use the SDK helper: \`useSealJobResults().decrypt(walrus_blob_id)\`.
+`;
+
+/**
+ * GET /v3/loop/digests/by-buyer/:wallet
+ *
+ * Returns the most recent weekly digest for the buyer (or null). The digest
+ * itself is markdown stored on Walrus; the FE fetches the blob on demand.
+ */
+router.get('/digests/by-buyer/:wallet', async (req: AuthRequest, res: Response) => {
+  if (!weeklyDigestEnabled()) return res.json({ digest: null });
+  const wallet = String(req.params.wallet ?? '').toLowerCase();
+  const headerWallet = (req.user?.address ?? '').toLowerCase();
+  if (!wallet || !headerWallet) return res.status(401).json({ error: 'wallet_required' });
+  if (wallet !== headerWallet) return res.status(403).json({ error: 'wallet_mismatch' });
+
+  const r = await pool.query<{ text: string; created_at: string }>(
+    `SELECT text, created_at
+       FROM cognitive_memories
+      WHERE namespace = $1
+        AND area_slug = 'digest'
+      ORDER BY created_at DESC LIMIT 1`,
+    [`artifact-vault-${wallet}`],
+  );
+  if (!r.rowCount) return res.json({ digest: null });
+  try {
+    const m = JSON.parse(r.rows[0].text) as {
+      job_id: string; artifact_name: string; walrus_blob_id: string; mime_type: string;
+    };
+    res.json({
+      digest: {
+        week: m.job_id.replace(/^digest-/, ''),
+        artifact_name: m.artifact_name,
+        walrus_blob_id: m.walrus_blob_id,
+        mime_type: m.mime_type,
+        created_at: r.rows[0].created_at,
+      },
+    });
+  } catch {
+    res.json({ digest: null });
+  }
 });
 
 router.post('/buyer/preferences/save', async (req: AuthRequest, res: Response) => {
@@ -875,11 +1066,12 @@ router.post('/agents/:id/run-workflow', async (req: AuthRequest, res: Response) 
     const dispatcher = new WorkflowDispatcher(
       memory(), _runNowOutcome(), new MockStepExecutor(), logger,
     );
+    const job_id = `runnow-${Date.now()}-${wallet.slice(2, 8)}`;
     const result = await dispatcher.run({
       workflow,
       agent_id: agent.slug,
       buyer_addr: wallet,
-      job_id: `runnow-${Date.now()}-${wallet.slice(2, 8)}`,
+      job_id,
       buyer_input,
       area_slug: workflow.para?.area_slug,
       budget_micro: 25_000_000,
@@ -892,6 +1084,27 @@ router.post('/agents/:id/run-workflow', async (req: AuthRequest, res: Response) 
       o?.daily_post ?? o?.final_output ?? o?.translated ?? o?.report_md ??
       o?.review_md ?? o?.analysis_md ?? o?.result_md ?? '',
     );
+
+    // Side effects (paid_calls + workflow_runs + vault deposit). Best-effort:
+    // never fails the buyer-visible response.
+    void recordWorkflowRunSideEffects(
+      { pool, vault: vault(), walrus: lazyWalrus(), logger },
+      {
+        result,
+        agent_id: agent.slug,
+        agent_pkid: agent.id,
+        buyer_addr: wallet,
+        request,
+        job_id,
+        area_slug: workflow.para?.area_slug ?? null,
+        payment: {
+          amount_usdc: usdcCoinType ? priceUsdc : '0',
+          tx_hash: tx_digest || `runnow:${job_id}`,
+          network: process.env.SUI_NETWORK ?? 'sui-testnet',
+          method: 'sui_usdc',
+        },
+      },
+    ).catch((e) => logger.warn({ err: (e as Error).message, job_id }, 'run-workflow:recorder_failed'));
 
     res.json({
       tx_digest: tx_digest || null,

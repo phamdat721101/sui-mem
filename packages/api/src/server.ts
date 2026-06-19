@@ -32,6 +32,25 @@ import {
   healthHandler,
   installLifecycle,
 } from './lib';
+import { pool } from './db';
+import { PersonaAutoRewriteCron, type ScheduledCron } from './services/loop/personaAutoRewrite';
+import { DailyArchivalPassCron } from './services/loop/dailyArchivalPass';
+import { WeeklyDigestCron } from './services/loop/weeklyDigestCron';
+import { ArtifactVaultService } from './services/loop/artifactVaultService';
+import { MemoryService } from './services/loop/memoryService';
+import {
+  WorkflowDispatcher,
+  validateWorkflow,
+} from './services/loop/workflowDispatcher';
+import { OutcomeEvaluator } from './services/loop/outcomeEvaluator';
+import { StopConditionEvaluator } from './services/loop/stopConditionEvaluator';
+import { MockStepExecutor } from './services/loop/mockStepExecutor';
+import {
+  WorkflowSchedulerCron,
+  type SubscriptionRunner,
+  type DueSubscription,
+} from './services/loop/workflowScheduler';
+import { recordWorkflowRunSideEffects } from './services/loop/workflowRunRecorder';
 
 /**
  * OpenX API — Sui-native after the EVM/Fhenix pivot.
@@ -108,3 +127,188 @@ if (missing.length) {
 
 const server = app.listen(PORT, () => logger.info({ port: PORT }, 'api:listening'));
 installLifecycle(server);
+
+// ─── Cron runner — single-threaded UTC heartbeat ─────────────────────────
+//
+// One setInterval ticks every 30s; we de-dupe within the same UTC minute so
+// each cron fires at most once per day at its `utc_minute`. Each cron's
+// `enabled()` predicate checks its feature flag at tick time so flips in
+// `.env` take effect on the next minute without restart.
+//
+// SOLID-LSP: every cron implements `ScheduledCron`; adding a new one = one
+// `crons.push(new …Cron(…))` line below.
+
+const noopMirror = { remember: async () => null };
+
+const personaSynth = {
+  /**
+   * Phala-backed persona synthesizer. Returns a 1-line proposal blob + a
+   * short reasoning string. Lazy-imports the Phala client so module load
+   * stays cheap when the flag is off.
+   */
+  synthesize: async (args: { agent_id: string; reflections: string[] }) => {
+    const { createPhalaClient } = await import('@fhe-ai-context/sui-sdk');
+    const phala = createPhalaClient();
+    const r = await phala.infer([
+      {
+        role: 'system',
+        content:
+          'You are a persona synthesizer. Given recent agent reflections, propose a brief delta to the persona system prompt that addresses the most-cited weakness. Output JSON: {"delta_md": "...", "reasoning": "..."}',
+      },
+      { role: 'user', content: JSON.stringify({ agent_id: args.agent_id, reflections: args.reflections.slice(0, 20) }) },
+    ]);
+    let parsed: { delta_md?: string; reasoning?: string } = {};
+    try { parsed = JSON.parse(r.answer); } catch { parsed = { delta_md: r.answer.slice(0, 1000), reasoning: 'plain text' }; }
+    return {
+      blob: new TextEncoder().encode(parsed.delta_md ?? ''),
+      reasoning: (parsed.reasoning ?? '').slice(0, 500),
+    };
+  },
+};
+
+const digestLLM = {
+  infer: async (messages: Array<{ role: 'system' | 'user'; content: string }>) => {
+    const { createPhalaClient } = await import('@fhe-ai-context/sui-sdk');
+    const phala = createPhalaClient();
+    const r = await phala.infer(messages);
+    return { answer: r.answer };
+  },
+};
+
+let _digestVault: ArtifactVaultService | null = null;
+const digestVault = () =>
+  (_digestVault ??= new ArtifactVaultService({ pool, mirror: noopMirror, logger }));
+
+const digestWalrus = {
+  upload: async (bytes: Uint8Array) => {
+    const { createWalrusStore } = await import('@fhe-ai-context/sui-sdk');
+    return createWalrusStore().upload(bytes);
+  },
+};
+
+/**
+ * SubscriptionRunner — concrete implementation of the previously-orphaned
+ * interface from workflowScheduler.ts. For each due subscription:
+ *   1. load the agent's saved workflow YAML (latest cognitive_memories row
+ *      under namespace `workflow-yaml-{agent_id}`)
+ *   2. run it through the same WorkflowDispatcher as instant runs
+ *   3. record side effects (paid_calls + workflow_runs + vault deposit)
+ *
+ * Same dispatcher path as /run-workflow → no duplication. The synthetic
+ * tx_hash `cron:sub-{id}-{job_id}` keeps paid_calls.UNIQUE happy and lets
+ * the studio show "X runs subscribed" cleanly per run.
+ */
+function buildSubscriptionRunner(): SubscriptionRunner {
+  const memory = new MemoryService({ pool, mirror: noopMirror, logger });
+  const vault = new ArtifactVaultService({ pool, mirror: noopMirror, logger });
+  const outcome = new OutcomeEvaluator(new StopConditionEvaluator({ pool, logger }), logger);
+  const executor = new MockStepExecutor();
+
+  return {
+    async forkAndRun(sub: DueSubscription): Promise<{ job_id: string }> {
+      // 1. Load the workflow YAML for this agent.
+      const wfRow = await pool.query<{ text: string; agent_pkid: string }>(
+        `SELECT cm.text AS text, a.id::text AS agent_pkid
+           FROM cognitive_memories cm
+           JOIN agents a ON (a.slug = $1 OR a.id::text = $1)
+          WHERE cm.namespace IN ('workflow-yaml-' || a.slug, 'workflow-yaml-' || a.id::text)
+          ORDER BY cm.created_at DESC LIMIT 1`,
+        [sub.agent_id],
+      );
+      if (!wfRow.rowCount) {
+        throw new Error(`scheduler: no workflow saved for agent ${sub.agent_id}`);
+      }
+      const workflow = validateWorkflow(JSON.parse(wfRow.rows[0].text));
+      const agent_pkid = wfRow.rows[0].agent_pkid;
+
+      // 2. Run the dispatcher (same path as instant runs).
+      const job_id = `sub-${sub.id}-${Date.now()}`;
+      const buyer_input = { request: 'daily-recurring run', topic: sub.area_slug ?? '' };
+      const dispatcher = new WorkflowDispatcher(memory, outcome, executor, logger);
+      const result = await dispatcher.run({
+        workflow,
+        agent_id: sub.agent_id,
+        buyer_addr: sub.buyer_addr,
+        job_id,
+        buyer_input,
+        area_slug: sub.area_slug ?? undefined,
+        budget_micro: Number(sub.max_per_run_micro) || 25_000_000,
+      });
+
+      // 3. Record side effects (paid_calls + workflow_runs + vault deposit).
+      await recordWorkflowRunSideEffects(
+        { pool, vault, walrus: digestWalrus, logger },
+        {
+          result,
+          agent_id: sub.agent_id,
+          agent_pkid,
+          buyer_addr: sub.buyer_addr,
+          request: buyer_input.request,
+          job_id,
+          area_slug: sub.area_slug ?? null,
+          workflow_walrus_blob_id: sub.template_walrus_blob_id ?? null,
+          payment: {
+            // Subscriptions prepay budget on-chain — credit the seller per fork
+            // using the configured max_per_run_micro as the realized amount.
+            amount_usdc: (Number(sub.max_per_run_micro) / 1_000_000).toFixed(6),
+            tx_hash: `cron:${sub.subscription_object_id}:${job_id}`,
+            network: process.env.SUI_NETWORK ?? 'sui-testnet',
+            method: 'sui_usdc',
+          },
+        },
+      );
+
+      return { job_id };
+    },
+  };
+}
+
+const crons: ScheduledCron[] = [
+  new PersonaAutoRewriteCron({
+    pool,
+    llm: personaSynth,
+    mirror: noopMirror,
+    logger,
+    enabled: () => process.env.FEATURE_LOOP_W3_PERSONA_AUTO_REWRITE === 'true',
+  }),
+  new DailyArchivalPassCron({
+    pool,
+    logger,
+    enabled: () => process.env.FEATURE_LOOP_W3_PARA_ARCHIVAL === 'true',
+  }),
+  new WeeklyDigestCron({
+    pool,
+    vault: digestVault(),
+    walrus: digestWalrus,
+    llm: digestLLM,
+    logger,
+    enabled: () => process.env.FEATURE_WEEKLY_DIGEST === 'true',
+  }),
+  new WorkflowSchedulerCron({
+    pool,
+    runner: buildSubscriptionRunner(),
+    logger,
+    enabled: () => process.env.FEATURE_LOOP_DAILY_RUN === 'true',
+  }),
+];
+
+let lastTickMinute = -1;
+const cronTimer = setInterval(async () => {
+  const now = new Date();
+  const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+  if (minute === lastTickMinute) return;
+  lastTickMinute = minute;
+  for (const c of crons) {
+    // The workflow scheduler is special: its docstring says it fires every
+    // minute and self-filters subscriptions by next_run_ts. All other crons
+    // fire only at their specific utc_minute-of-day.
+    const isScheduler = c.name === 'workflowScheduler';
+    if (!isScheduler && c.utc_minute !== minute) continue;
+    try {
+      await c.tick(now);
+    } catch (e) {
+      logger.error({ cron: c.name, err: (e as Error).message }, 'cron:tick_failed');
+    }
+  }
+}, 30_000);
+cronTimer.unref();

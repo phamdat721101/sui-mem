@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { api } from '@/lib/api';
+import { api, explorerTxUrl } from '@/lib/api';
 
 /**
  * AgentRecentCalls — anonymized public ledger feed.
@@ -36,10 +36,9 @@ function relativeTime(iso: string): string {
 }
 
 function explorerUrl(network: string, txHash: string): string | null {
-  if (network === 'demo' || txHash.startsWith('demo:')) return null;
-  if (network === 'sui-testnet') return `https://suiscan.xyz/testnet/tx/${txHash}`;
-  if (network === 'sui-mainnet') return `https://suiscan.xyz/mainnet/tx/${txHash}`;
-  return null;
+  // Centralized helper: skips synthetic prefixes (demo:/cron:/runnow:) and
+  // unsupported networks. SOLID-DIP — defined once in lib/api.ts.
+  return explorerTxUrl(network, txHash);
 }
 
 export function AgentRecentCalls({ slug, limit = 10 }: { slug: string; limit?: number }) {

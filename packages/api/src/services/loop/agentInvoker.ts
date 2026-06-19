@@ -46,14 +46,21 @@ import {
   type PhalaInferenceClient,
   type WalrusStore,
 } from '@fhe-ai-context/sui-sdk';
+import { pool } from '../../db';
+import { MemoryService, type WarmContextResult } from './memoryService';
 
 const RUNNER_MEM_SOFT_LIMIT_MS = 30_000;
+const MODE_A_MEMORY_FLAG = 'FEATURE_LOOP_MODE_A_MEMORY';
+
+const noopMirror = { remember: async () => null };
 
 export interface AgentManifest {
   title: string;
   persona_system_prompt: string;
   default_model_id?: string;
   word_limit?: number;
+  /** Optional PARA area tag — surfaces in vault rows + Mode A memory writes. */
+  area_slug?: string | null;
 }
 
 export interface InvokeAgentInputs {
@@ -69,6 +76,9 @@ export interface InvokeAgentInputs {
     iv?: Uint8Array;
   };
   correlationId: string;
+  /** On-chain settlement digest (from `loopX402Middleware.req.loopX402Settlement`).
+   *  Stored on the L2 memory row for buyer-verifiable on-chain provenance. */
+  suiTxDigest?: string | null;
 }
 
 export interface InvokeAgentResult {
@@ -91,6 +101,9 @@ export interface AgentInvokerDeps {
   seal: SealKeyClient;
   walrus: WalrusStore;
   phala: PhalaInferenceClient;
+  /** MemoryService — when injected and FEATURE_LOOP_MODE_A_MEMORY=true,
+   *  Mode A reads warm context (step 2.5) and fires async writes (step 9b). */
+  memory?: MemoryService;
   logger?: Logger;
 }
 
@@ -103,6 +116,7 @@ export class LoopAgentInvoker {
       seal: createSealKeyClient(),
       walrus: createWalrusStore(),
       phala: createPhalaClient(),
+      memory: new MemoryService({ pool, mirror: noopMirror, logger: logger as never }),
       logger,
     });
   }
@@ -128,10 +142,37 @@ export class LoopAgentInvoker {
       throw new Error(`loop:invoke:word_limit_exceeded:${args.manifest.word_limit}`);
     }
 
+    // 2.5 Warm-context recall (Mode A F6 reflexive loop).
+    // Reads cog-l4-{agent_id} + cog-l4-{agent_id}-{buyer_addr} via a single
+    // SQL query. Soft-fail: any error degrades to no recall, never blocks
+    // the paid call.
+    let warmContext: WarmContextResult | null = null;
+    if (this.deps.memory && process.env[MODE_A_MEMORY_FLAG] === 'true') {
+      try {
+        warmContext = await this.deps.memory.readWarmContext({
+          agent_id: args.agentObjectId,
+          buyer_addr: args.buyerAddress,
+          area_slug: args.manifest.area_slug ?? undefined,
+          limit: 8,
+        });
+        log('mode-a:warm_context_loaded', {
+          general: warmContext.agent_general.length,
+          per_buyer: warmContext.per_buyer.length,
+        });
+      } catch (e) {
+        this.deps.logger?.warn(
+          { err: (e as Error).message, correlation_id: args.correlationId },
+          'mode-a:warm_context_failed_continue',
+        );
+        warmContext = null;
+      }
+    }
+
     // 4. Phala TEE inference.
     log('loop:invoke:phala');
+    const augmentedSystemPrompt = augmentSystemPrompt(args.manifest.persona_system_prompt, warmContext);
     const inf = await this.deps.phala.infer([
-      { role: 'system', content: args.manifest.persona_system_prompt },
+      { role: 'system', content: augmentedSystemPrompt },
       { role: 'user', content: userText },
     ]);
     log('loop:invoke:phala_done', { response_chars: inf.answer.length, attested: inf.attestation.verified });
@@ -166,6 +207,73 @@ export class LoopAgentInvoker {
     }
 
     log('loop:invoke:done', { ms: runnerMemoryMs, blob_id: responseWalrusBlobId });
+
+    // 9b. Fire-and-forget memory writes (Mode A F6 reflexive loop).
+    // setImmediate ensures the buyer response returns first; writes happen
+    // off the hot path. Each write soft-fails independently. Latency drag
+    // on the buyer-visible call: 0ms.
+    if (this.deps.memory && process.env[MODE_A_MEMORY_FLAG] === 'true') {
+      const memory = this.deps.memory;
+      const recordedAt = new Date().toISOString();
+      const promptExcerpt = userText.slice(0, 1000);
+      const responseExcerpt = inf.answer.slice(0, 2000);
+      const isRepeatBuyer = !!(warmContext && warmContext.per_buyer.length > 0);
+      const baseClassify = {
+        is_repeat_buyer_in_area: isRepeatBuyer,
+        area_slug: args.manifest.area_slug ?? null,
+        explicit_para_kind: null,
+      };
+      const summary =
+        `${args.manifest.area_slug ?? 'unfiled'} paid call · ${runnerMemoryMs}ms · ${args.suiTxDigest ?? 'no-tx'}`;
+      const safeWarn = (event: string) => (e: Error) =>
+        this.deps.logger?.warn({ err: e.message, event, correlation_id: args.correlationId }, event);
+
+      setImmediate(() => {
+        // L2 — episodic per-step.
+        void memory.writeL2({
+          agent_id: args.agentObjectId,
+          job_id: args.jobNonce,
+          step_id: 'mode-a-paid-call',
+          text: JSON.stringify({
+            recorded_at: recordedAt,
+            prompt_excerpt: promptExcerpt,
+            response_excerpt: responseExcerpt,
+            duration_ms: runnerMemoryMs,
+            sui_tx_digest: args.suiTxDigest ?? null,
+            response_walrus_blob_id: responseWalrusBlobId,
+          }).slice(0, 4000),
+        }).catch(safeWarn('mode-a:writeL2_failed'));
+
+        // L3 — long-term per-job.
+        void memory.writeL3({
+          agent_id: args.agentObjectId,
+          job_id: args.jobNonce,
+          text: `Paid call complete: ${summary}`,
+        }).catch(safeWarn('mode-a:writeL3_failed'));
+
+        // L4 per-buyer — relationship slot (the warm-context source).
+        void memory.writeL4PerBuyer({
+          agent_id: args.agentObjectId,
+          buyer_addr: args.buyerAddress,
+          text: `Buyer paid call: ${summary}`,
+          classify: baseClassify,
+        }).catch(safeWarn('mode-a:writeL4PerBuyer_failed'));
+
+        // L5 per-buyer — per-call critique.
+        void memory.writeL5PerBuyer({
+          agent_id: args.agentObjectId,
+          buyer_addr: args.buyerAddress,
+          text: `Per-call critique: ${runnerMemoryMs}ms · attested=${inf.attestation.verified}`,
+        }).catch(safeWarn('mode-a:writeL5PerBuyer_failed'));
+
+        // L4 agent (anonymized) — feeds the agent's general craft brain.
+        void memory.writeL4Agent({
+          agent_id: args.agentObjectId,
+          text: `Anonymized paid-call: area=${args.manifest.area_slug ?? 'unfiled'} duration=${runnerMemoryMs}ms`,
+          classify: { ...baseClassify, is_repeat_buyer_in_area: false },
+        }).catch(safeWarn('mode-a:writeL4Agent_failed'));
+      });
+    }
 
     return {
       responseWalrusBlobId,
@@ -205,4 +313,27 @@ export class LoopAgentInvoker {
     const plain = await aesGcmDecrypt({ ciphertext, key: aesKey, iv: args.inputs.iv });
     return new TextDecoder('utf-8', { fatal: false }).decode(plain);
   }
+}
+
+/**
+ * Splice warm-context recall hits into the persona system prompt.
+ *
+ * Format mimics the Mode B dispatcher (`dispatcher:warm_context_loaded` log).
+ * Per-buyer hits come first (most actionable for repeat buyers); general
+ * craft hits second. Total recall block is hard-capped to keep prompt token
+ * usage predictable. SOLID-SRP: one tiny pure function — easy to test.
+ */
+function augmentSystemPrompt(
+  basePrompt: string,
+  warm: WarmContextResult | null,
+): string {
+  if (!warm) return basePrompt;
+  const perBuyer = warm.per_buyer.slice(0, 3);
+  const general = warm.agent_general.slice(0, 3);
+  if (!perBuyer.length && !general.length) return basePrompt;
+  const lines: string[] = ['', '---', 'Warm context recalled from prior runs:'];
+  perBuyer.forEach((h, i) => lines.push(`[buyer-${i}] ${h.text.slice(0, 300)}`));
+  general.forEach((h, i) => lines.push(`[general-${i}] ${h.text.slice(0, 200)}`));
+  lines.push('---', '');
+  return `${basePrompt}\n${lines.join('\n')}`;
 }
