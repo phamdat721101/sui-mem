@@ -24,7 +24,8 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { useCurrentAccount } from '@mysten/dapp-kit';
+import { useCurrentAccount, useSignAndExecuteTransaction, useSuiClient } from '@mysten/dapp-kit';
+import { Transaction } from '@mysten/sui/transactions';
 import { api, walrusViewUrl, isPlaceholderBlob, vaultDownload, type RunGroup, type RunStatus } from '@/lib/api';
 
 const FEATURE_TIMELINE = process.env.NEXT_PUBLIC_FEATURE_LOOP_RUN_TIMELINE !== 'false';
@@ -39,6 +40,11 @@ interface Subscription {
   next_run_ts: number;
   last_run_ts: number | null;
   cancelled_at: string | null;
+  // v2 escrow surfaces; legacy v1 rows have these undefined.
+  escrow_remaining_micro?: string;
+  total_escrowed_micro?: string;
+  package_version?: number;
+  status?: 'active' | 'stopped' | 'cancelled' | 'exhausted';
 }
 
 interface VaultEntry {
@@ -126,9 +132,12 @@ function SubscriptionsPanel({
   wallet: string;
   statusByAgent: Map<string, RunStatus>;
 }) {
+  const client = useSuiClient();
+  const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
   const [subs, setSubs] = useState<Subscription[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [topUpFor, setTopUpFor] = useState<string | null>(null);
 
   const reload = () => {
     api.listSubscriptions(wallet)
@@ -138,14 +147,56 @@ function SubscriptionsPanel({
 
   useEffect(() => { reload(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [wallet]);
 
-  const cancel = async (subscription_object_id: string) => {
-    setBusyId(subscription_object_id);
+  /**
+   * Cancel — v2 returns a PTB the buyer signs (refund hits the wallet on
+   * chain); v1 returns `{ ok: true }` from a DB-only cancel. The same FE
+   * helper handles both: if `ptb_bytes_b64` is present we sign + execute,
+   * otherwise we just refresh.
+   */
+  const cancel = async (s: Subscription) => {
+    setError(null);
+    setBusyId(s.subscription_object_id);
     try {
-      const r = await fetch(
-        `${process.env.NEXT_PUBLIC_AGENT_BACKEND_URL ?? 'http://localhost:3001'}/v3/loop/subscriptions/${encodeURIComponent(subscription_object_id)}/cancel`,
-        { method: 'POST', headers: { 'x-wallet-address': wallet } },
-      );
-      if (!r.ok) throw new Error(`cancel ${r.status}`);
+      const r = await api.buildCancelSubscription(wallet, s.subscription_object_id);
+      if (r.ptb_bytes_b64) {
+        const txBytes = Uint8Array.from(atob(r.ptb_bytes_b64), (c) => c.charCodeAt(0));
+        const signed = await signAndExecute({
+          transaction: Transaction.from(txBytes) as unknown as Parameters<typeof signAndExecute>[0]['transaction'],
+        });
+        await client.waitForTransaction({ digest: signed.digest, timeout: 30_000 }).catch(() => undefined);
+      }
+      reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /** Top up an existing v2 escrow with `runs_to_add` more runs of budget. */
+  const topUp = async (s: Subscription, runs_to_add: number) => {
+    setError(null);
+    setBusyId(s.subscription_object_id);
+    try {
+      const cfg = await api.getSellerV2Config().catch(() => null);
+      const usdcCoinType = cfg?.usdc_coin_type;
+      if (!usdcCoinType) throw new Error('USDC coin type not configured');
+      const needed = BigInt(runs_to_add) * BigInt(s.max_per_run_micro);
+      const coins = await client.getCoins({ owner: wallet, coinType: usdcCoinType, limit: 50 });
+      const coin = coins.data.find((c) => BigInt(c.balance) >= needed);
+      if (!coin) {
+        throw new Error(`Need $${(Number(needed) / 1e6).toFixed(2)} USDC in a single coin`);
+      }
+      const r = await api.buildTopUpPtb(wallet, s.subscription_object_id, {
+        runs_to_add,
+        budget_coin_object_id: coin.coinObjectId,
+      });
+      const txBytes = Uint8Array.from(atob(r.ptb_bytes_b64), (c) => c.charCodeAt(0));
+      const signed = await signAndExecute({
+        transaction: Transaction.from(txBytes) as unknown as Parameters<typeof signAndExecute>[0]['transaction'],
+      });
+      await client.waitForTransaction({ digest: signed.digest, timeout: 30_000 }).catch(() => undefined);
+      setTopUpFor(null);
       reload();
     } catch (e) {
       setError((e as Error).message);
@@ -166,7 +217,11 @@ function SubscriptionsPanel({
       {subs && subs.length > 0 && (
         <ul className="space-y-2">
           {subs.map((s) => {
-            const status = statusByAgent.get(s.agent_id);
+            const runStatus = statusByAgent.get(s.agent_id);
+            const escrowStatus = s.status ?? (s.cancelled_at ? 'cancelled' : 'active');
+            const isV2 = (s.package_version ?? 1) === 2;
+            const isStopped = escrowStatus === 'stopped';
+            const isActive = escrowStatus === 'active';
             return (
               <li key={s.subscription_object_id} className="rounded-lg border border-outline-variant/20 bg-surface-container-low p-3">
                 <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -178,38 +233,127 @@ function SubscriptionsPanel({
                       {s.area_slug}
                     </span>
                   )}
-                  {status && <SubscriptionStatusBadge status={status} />}
+                  <EscrowStatusBadge status={escrowStatus} />
+                  {runStatus && <SubscriptionStatusBadge status={runStatus} />}
                   <span className="font-mono text-[10px] text-on-surface-variant">
-                    {s.runs_remaining} runs remaining · daily at {formatUtcMinute(s.cron_utc_minute)} UTC
+                    {s.runs_remaining} runs · daily at {formatUtcMinute(s.cron_utc_minute)} UTC
                   </span>
                   <span className="font-mono text-[10px] text-on-surface-variant">
-                    ${(s.max_per_run_micro / 1_000_000).toFixed(2)} max / run
+                    ${(s.max_per_run_micro / 1_000_000).toFixed(2)} / run
                   </span>
-                  {s.cancelled_at ? (
-                    <span className="rounded bg-error/20 px-1.5 py-0.5 font-mono text-[10px] text-error">
-                      cancelled
+                  {s.escrow_remaining_micro != null && (
+                    <span className="font-mono text-[10px] text-on-surface-variant">
+                      escrow ${(Number(s.escrow_remaining_micro) / 1_000_000).toFixed(2)}
                     </span>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => cancel(s.subscription_object_id)}
-                      disabled={busyId === s.subscription_object_id}
-                      className="ml-auto rounded-full border border-error/40 px-2 py-0.5 font-mono text-[10px] text-error hover:bg-error/10 disabled:opacity-40"
-                    >
-                      {busyId === s.subscription_object_id ? 'Cancelling…' : 'Cancel'}
-                    </button>
                   )}
+                  <div className="ml-auto flex items-center gap-1.5">
+                    {isV2 && (isActive || isStopped) && (
+                      <button
+                        type="button"
+                        onClick={() => setTopUpFor(topUpFor === s.subscription_object_id ? null : s.subscription_object_id)}
+                        disabled={busyId === s.subscription_object_id}
+                        className={`rounded-full border px-2 py-0.5 font-mono text-[10px] disabled:opacity-40 ${
+                          isStopped
+                            ? 'border-amber-500/60 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
+                            : 'border-primary/40 text-primary hover:bg-primary/10'
+                        }`}
+                      >
+                        {isStopped ? 'Top up to restart' : 'Top up'}
+                      </button>
+                    )}
+                    {!s.cancelled_at && (
+                      <button
+                        type="button"
+                        onClick={() => cancel(s)}
+                        disabled={busyId === s.subscription_object_id}
+                        className="rounded-full border border-error/40 px-2 py-0.5 font-mono text-[10px] text-error hover:bg-error/10 disabled:opacity-40"
+                      >
+                        {busyId === s.subscription_object_id ? 'Working…' : isStopped ? 'Cancel & refund' : 'Cancel'}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-on-surface-variant">
                   <span>next run · {fmtTs(s.next_run_ts)}</span>
                   {s.last_run_ts && <span>last run · {fmtTs(s.last_run_ts)}</span>}
                 </div>
+
+                {/* Inline top-up form. Same layout idiom as the Cancel button. */}
+                {topUpFor === s.subscription_object_id && (
+                  <TopUpInlineForm
+                    busy={busyId === s.subscription_object_id}
+                    perRunUsd={s.max_per_run_micro / 1_000_000}
+                    onSubmit={(n) => topUp(s, n)}
+                    onClose={() => setTopUpFor(null)}
+                  />
+                )}
               </li>
             );
           })}
         </ul>
       )}
     </Section>
+  );
+}
+
+/**
+ * Read-only badge that mirrors the four states from `services/loop/escrowStatus`.
+ * Same color palette as the run-status badges so the two reads side-by-side.
+ */
+function EscrowStatusBadge({ status }: { status: 'active' | 'stopped' | 'cancelled' | 'exhausted' }) {
+  const cls =
+    status === 'active'    ? 'bg-emerald-500/15 text-emerald-300' :
+    status === 'stopped'   ? 'bg-amber-500/20 text-amber-300' :
+    status === 'cancelled' ? 'bg-error/20 text-error' :
+                             'bg-on-surface/10 text-on-surface-variant';
+  return (
+    <span className={`rounded px-1.5 py-0.5 font-mono text-[10px] uppercase ${cls}`}>{status}</span>
+  );
+}
+
+/**
+ * Inline +N form for topping up a stopped/active escrow. Single input;
+ * computes the on-chain charge from `runs_to_add * per_run`. Closes itself
+ * on submit/cancel.
+ */
+function TopUpInlineForm({
+  busy, perRunUsd, onSubmit, onClose,
+}: {
+  busy: boolean; perRunUsd: number;
+  onSubmit: (runs_to_add: number) => void;
+  onClose: () => void;
+}) {
+  const [n, setN] = useState(7);
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-outline-variant/30 bg-background p-2 text-[11px]">
+      <span className="font-mono uppercase text-on-surface-variant">runs to add</span>
+      <input
+        type="number" min={1} max={366}
+        value={n}
+        onChange={(e) => setN(Math.max(1, Math.min(366, Number(e.target.value) || 1)))}
+        className="w-16 rounded bg-surface-container-low px-2 py-1 font-mono"
+        disabled={busy}
+      />
+      <span className="font-mono text-on-surface-variant">
+        = ${(n * perRunUsd).toFixed(2)} USDC
+      </span>
+      <button
+        type="button"
+        onClick={() => onSubmit(n)}
+        disabled={busy || n < 1}
+        className="ml-auto rounded-full bg-primary px-3 py-1 text-[10px] font-mono uppercase text-on-primary disabled:opacity-40"
+      >
+        {busy ? 'Signing…' : `Top up (${n})`}
+      </button>
+      <button
+        type="button"
+        onClick={onClose}
+        disabled={busy}
+        className="rounded-full border border-outline-variant/40 px-2 py-1 text-[10px] font-mono uppercase text-on-surface-variant"
+      >
+        Close
+      </button>
+    </div>
   );
 }
 

@@ -22,9 +22,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useCurrentAccount, useSuiClient } from '@mysten/dapp-kit';
-import { api, explorerTxUrl, walrusViewUrl, type SellerProfile } from '@/lib/api';
-
-const NETWORK = process.env.NEXT_PUBLIC_SUI_NETWORK ?? 'sui-testnet';
+import { api, walrusViewUrl, type SellerProfile } from '@/lib/api';
 
 export default function SettingsPage() {
   const account = useCurrentAccount();
@@ -92,7 +90,14 @@ function CommandCenter({ wallet }: { wallet: string }) {
           <BrandedMilestones stats={stats} dash={dash} events={events} />
         </aside>
         <main className="space-y-4 lg:col-span-2">
-          <ActivityLedger events={events} />
+          <Panel title="ON-CHAIN_ACTIVITY">
+            <div className="border-t border-outline-variant/20 pt-3 text-[11px] text-on-surface-variant">
+              On-chain ledger and Active hires moved to the studio dashboard for one-stop seller tracking.
+              <Link href="/studio/dashboard" className="ml-2 inline-flex items-center gap-1 rounded-full border border-primary/40 px-2 py-0.5 text-[10px] uppercase text-primary hover:bg-primary/10">
+                go to dashboard →
+              </Link>
+            </div>
+          </Panel>
           <ResourceInventory dash={dash} events={events} />
           <CapabilityManifest config={config} />
         </main>
@@ -294,74 +299,6 @@ function BrandedMilestones({
 }
 
 // ─── Panel 5: On-chain activity ledger ───────────────────────────────
-
-const EVENT_LABEL: Record<string, string> = {
-  LoopAgentPublished:    'Agent Published',
-  AgentPublishFeePaid:   'Fee Paid',
-  AgentPricingUpdated:   'Pricing Updated',
-  AgentModelUpdated:     'Model Updated',
-  AgentManifestUpdated:  'Manifest Updated',
-  AgentManifestAttested: 'Manifest Attested',
-  LoopAgentRevoked:      'Agent Revoked',
-  LoopAgentReputationUpdated: 'Reputation Updated',
-  BedrockModelWhitelisted:    'Model Whitelisted',
-  BedrockModelDelisted:       'Model Delisted',
-};
-
-function ActivityLedger({
-  events,
-}: {
-  events: Awaited<ReturnType<typeof api.getSellerWalletEvents>>['events'];
-}) {
-  return (
-    <Panel title="ON-CHAIN_ACTIVITY_LEDGER">
-      <div className="border-t border-outline-variant/20 pt-3">
-        {events.length === 0 ? (
-          <p className="text-[11px] text-on-surface-variant">No events yet. Publish or update an agent to see history here.</p>
-        ) : (
-          <div className="-mx-4 overflow-x-auto md:mx-0">
-            <table className="w-full min-w-[560px] text-[11px]">
-              <thead>
-                <tr className="text-left text-[10px] uppercase text-on-surface-variant">
-                  <th className="px-4 pb-2 font-normal md:px-0">Event</th>
-                  <th className="px-2 pb-2 font-normal md:px-0">Type</th>
-                  <th className="px-2 pb-2 text-right font-normal md:px-0">Amount</th>
-                  <th className="px-2 pb-2 text-right font-normal md:px-0">Status</th>
-                  <th className="px-4 pb-2 text-right font-normal md:px-0">Explorer</th>
-                </tr>
-              </thead>
-              <tbody>
-                {events.map((e) => {
-                  const explorer = explorerTxUrl(NETWORK, e.tx_digest);
-                  const amount = formatEventAmount(e.type, e.payload);
-                  const typeBadge = e.type.startsWith('AgentPublishFeePaid') || e.type.includes('Pricing') ? 'USDC' : 'SUI';
-                  return (
-                    <tr key={`${e.tx_digest}-${e.seq_in_tx}`} className="border-t border-outline-variant/10">
-                      <td className="whitespace-nowrap px-4 py-2 text-on-surface md:px-0">{EVENT_LABEL[e.type] ?? e.type}</td>
-                      <td className="whitespace-nowrap px-2 py-2 text-primary md:px-0">{typeBadge}</td>
-                      <td className="whitespace-nowrap px-2 py-2 text-right text-on-surface md:px-0">{amount ?? '—'}</td>
-                      <td className="whitespace-nowrap px-2 py-2 text-right text-secondary-fixed md:px-0">CONFIRMED</td>
-                      <td className="whitespace-nowrap px-4 py-2 text-right md:px-0">
-                        {explorer ? (
-                          <a href={explorer} target="_blank" rel="noreferrer" className="text-primary hover:underline">
-                            {e.tx_digest.slice(0, 6)}…{e.tx_digest.slice(-4)} ↗
-                          </a>
-                        ) : (
-                          <span className="text-on-surface-variant">{e.tx_digest.slice(0, 6)}…</span>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </Panel>
-  );
-}
-
 // ─── Panel 6: Resource inventory ────────────────────────────────────
 
 function ResourceInventory({
@@ -618,15 +555,4 @@ function formatUsdcMicro(micro: bigint): string {
 function formatUsdc(s: string | number): string {
   const n = typeof s === 'string' ? Number(s) : s;
   return Number.isFinite(n) ? n.toFixed(2) : '0.00';
-}
-function formatEventAmount(type: string, payload: Record<string, unknown>): string | null {
-  if (type === 'AgentPublishFeePaid') {
-    const fee = Number(payload.fee_micro ?? 0);
-    return Number.isFinite(fee) ? `$${(fee / 1e6).toFixed(2)}` : null;
-  }
-  if (type === 'AgentPricingUpdated') {
-    const v = Number(payload.new_per_iter_default ?? 0);
-    return Number.isFinite(v) ? `$${(v / 1e6).toFixed(4)}/call` : null;
-  }
-  return null;
 }

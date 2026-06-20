@@ -196,7 +196,7 @@ function ListingDetail({ listing }: { listing: Listing }) {
           >
             For AI integrators →
           </Link>
-          <HireWorkflowButton agentSlug={listing.slug} />
+          <HireWorkflowButton agentSlug={listing.slug} onChainAgentId={listing.agent_object_id} />
           <CopyButton value={curl} label="Copy curl" full />
         </div>
         <div className="mt-4">
@@ -306,7 +306,7 @@ function MemWalDetail({ brain }: { brain: MemWalBrain }) {
             View on Suiscan
           </Link>
           <RunWorkflowNowButton agentSlug={brain.sui_object_id} />
-          <HireWorkflowButton agentSlug={brain.sui_object_id} />
+          <HireWorkflowButton agentSlug={brain.sui_object_id} onChainAgentId={brain.sui_object_id} />
         </div>
       </aside>
     </div>
@@ -410,8 +410,42 @@ function autoGeneratePrompt(listing: Listing, url: string): string {
 
 // ─── Hire workflow (buyer-side, opens modal) ────────────────────────────
 
-function HireWorkflowButton({ agentSlug }: { agentSlug: string }) {
+/**
+ * Hire-workflow CTA, gated on the seller's on-chain readiness.
+ *
+ * Props:
+ *  - `agentSlug` — the human URL slug. Always used for the workflow preview
+ *    fetch (which is index-agnostic).
+ *  - `onChainAgentId` — the live Sui shared-Agent id resolved server-side
+ *    via the `LoopAgentPublished` indexer. `null` ⇒ off-chain only; we
+ *    swap the button for a clear call-to-action telling the seller (or
+ *    informing the buyer) what's missing, instead of letting the buyer
+ *    sign a PTB the API will refuse.
+ *
+ * Single source of truth: the same `agent_object_id` that gates `POST
+ * /v3/loop/subscriptions` server-side. No FE-only feature flag, no parallel
+ * "is the agent published" call.
+ */
+function HireWorkflowButton({
+  agentSlug,
+  onChainAgentId,
+}: {
+  agentSlug: string;
+  onChainAgentId: string | null;
+}) {
   const [open, setOpen] = useState(false);
+
+  if (!onChainAgentId) {
+    return (
+      <div
+        className="block w-full rounded-md border border-amber-500/40 bg-amber-500/5 p-2.5 text-center font-mono text-[10px] uppercase tracking-wider text-amber-300"
+        title="The seller must complete on-chain publish (LoopAgentPublished event) before buyers can escrow USDC."
+      >
+        ⚠ Off-chain only · cannot escrow yet
+      </div>
+    );
+  }
+
   return (
     <>
       <button
@@ -436,6 +470,8 @@ interface HireForm {
 
 function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose: () => void }) {
   const account = useCurrentAccount();
+  const client = useSuiClient();
+  const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
   const [f, setF] = useState<HireForm>({
     area_slug: '',
     recurring: false,
@@ -444,6 +480,7 @@ function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose:
     max_per_run_micro: 10_000_000,
   });
   const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
 
@@ -467,6 +504,7 @@ function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose:
     }
     setBusy(true);
     setError(null);
+    setDone(null);
     try {
       if (!f.recurring) {
         // One-shot — link to the existing /run path which already wires the
@@ -475,31 +513,88 @@ function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose:
         setDone('Use "Run a task" for one-shot calls — workflow is multi-step orchestration.');
         return;
       }
-      const r = await fetch(`${AGENT_BACKEND_URL}/v3/loop/subscriptions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-wallet-address': account.address },
-        body: JSON.stringify({
-          agent_object_id: agentSlug,
-          template_walrus_blob_id: 'pending-walrus-pin',
-          area_slug: f.area_slug,
-          cron_utc_minute: f.cron_utc_minute,
-          runs: f.runs,
-          max_per_run_micro: f.max_per_run_micro,
-          budget_coin_object_id: 'pending-coin-select',
-        }),
-      });
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}));
-        throw new Error(j.error ?? `subscribe ${r.status}`);
+
+      // 1. Discover a USDC coin big enough to escrow `runs * max_per_run`.
+      setStatus('Finding USDC coin…');
+      const total = BigInt(f.runs) * BigInt(f.max_per_run_micro);
+      // We don't know the USDC type client-side without calling /v2-config.
+      // The seller-v2 config exposes it; reuse that endpoint (fast, cached).
+      const cfg = await api.getSellerV2Config().catch(() => null);
+      const usdcCoinType = cfg?.usdc_coin_type;
+      if (!usdcCoinType) throw new Error('USDC coin type not configured on backend');
+      const coins = await client.getCoins({ owner: account.address, coinType: usdcCoinType, limit: 50 });
+      const coin = coins.data.find((c) => BigInt(c.balance) >= total);
+      if (!coin) {
+        throw new Error(
+          `Insufficient USDC — need $${(Number(total) / 1e6).toFixed(2)} in a single coin. ` +
+          `Merge your USDC coins or top up your wallet.`,
+        );
       }
-      const j = (await r.json()) as { subscription?: { runs_remaining: number } };
+
+      // 2. Ask the backend to build the create_escrow PTB.
+      setStatus('Building escrow transaction…');
+      const built = await api.buildCreateEscrowPtb(account.address, {
+        agent_object_id: agentSlug,
+        template_walrus_blob_id: workflow ? `workflow-${agentSlug}` : 'pending-walrus-pin',
+        area_slug: f.area_slug || undefined,
+        cron_utc_minute: f.cron_utc_minute,
+        runs: f.runs,
+        max_per_run_micro: f.max_per_run_micro,
+        budget_coin_object_id: coin.coinObjectId,
+      });
+
+      // 3. Sign + execute the PTB. We pass the base64 bytes directly via
+      //    `Transaction.from()` so the FE never re-builds the call (one
+      //    source of truth on the server).
+      setStatus('Approve in wallet…');
+      const txBytes = Uint8Array.from(atob(built.ptb_bytes_b64), (c) => c.charCodeAt(0));
+      const signed = await signAndExecute({
+        transaction: Transaction.from(txBytes) as unknown as Parameters<typeof signAndExecute>[0]['transaction'],
+      });
+
+      // 4. Wait + capture the created WorkflowEscrow object id.
+      setStatus('Waiting for chain confirmation…');
+      const effects = await client.waitForTransaction({
+        digest: signed.digest,
+        timeout: 30_000,
+        options: { showEffects: true, showObjectChanges: true },
+      });
+      // Shared object created in the same tx: object_changes carries it.
+      const createdEscrow = effects.objectChanges?.find(
+        (c) => c.type === 'created' &&
+          'objectType' in c &&
+          typeof c.objectType === 'string' &&
+          c.objectType.includes('::openx_workflow_escrow::WorkflowEscrow<'),
+      );
+      const escrowId = createdEscrow && 'objectId' in createdEscrow ? createdEscrow.objectId : null;
+      if (!escrowId) {
+        throw new Error('Escrow object not found in tx effects');
+      }
+
+      // 5. Optimistic mirror so /activity shows the row before the indexer
+      //    catches up. Idempotent — indexer overwrites with chain truth.
+      //    Use the API-resolved canonical agent_object_id so the row joins
+      //    cleanly with `agent_events` regardless of what the URL slug was.
+      await api.confirmSubscription(account.address, {
+        subscription_object_id: escrowId,
+        agent_id: built.agent_object_id,
+        template_walrus_blob_id: workflow ? `workflow-${agentSlug}` : 'pending-walrus-pin',
+        area_slug: f.area_slug || undefined,
+        cron_utc_minute: f.cron_utc_minute,
+        runs: f.runs,
+        max_per_run_micro: f.max_per_run_micro,
+        total_escrow_micro: built.total_escrow_micro,
+      }).catch(() => undefined);
+
       setDone(
-        `Subscription staged · ${j.subscription?.runs_remaining ?? f.runs} runs at ${formatHm(f.cron_utc_minute)} UTC. View in /activity.`,
+        `Hired · ${f.runs} runs escrowed · daily at ${formatHm(f.cron_utc_minute)} UTC. ` +
+        `View in /activity → tx ${signed.digest.slice(0, 10)}…`,
       );
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setBusy(false);
+      setStatus(null);
     }
   };
 
@@ -583,6 +678,12 @@ function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose:
         )}
 
         {error && <div className="rounded-md border border-error/40 bg-error/10 p-2 text-xs text-error">{error}</div>}
+        {busy && status && (
+          <div className="rounded-md border border-primary/30 bg-primary/5 p-2 text-xs text-on-surface-variant">
+            <span className="material-symbols-outlined animate-spin text-[14px] align-middle">progress_activity</span>
+            <span className="ml-1.5 align-middle">{status}</span>
+          </div>
+        )}
         {done && <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-2 text-xs text-emerald-300">✓ {done}</div>}
 
         <div className="flex justify-end gap-2 pt-1">
@@ -599,7 +700,7 @@ function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose:
             disabled={busy || !account?.address}
             className="rounded-full bg-primary px-4 py-2 text-xs text-on-primary disabled:opacity-40"
           >
-            {busy ? 'Submitting…' : f.recurring ? `Subscribe (${f.runs} runs)` : 'Hire one-shot'}
+            {busy ? (status ?? 'Submitting…') : f.recurring ? `Subscribe (${f.runs} runs)` : 'Hire one-shot'}
           </button>
         </div>
       </div>

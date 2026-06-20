@@ -108,6 +108,14 @@ export interface Listing {
   title: string;
   description: string | null;
   tags: string[] | null;
+  /**
+   * On-chain `Agent` shared object id, resolved server-side via the
+   * indexer's first `LoopAgentPublished` event for this row's
+   * `fee_tx_digest`. `null` ⇒ off-chain only (no escrow possible — the
+   * Hire button must surface the gap, not let the buyer hit a confusing
+   * `agent_not_found_or_unpublished` 404 mid-flow).
+   */
+  agent_object_id: string | null;
 }
 
 /** A row from `GET /v3/memory/marketplace`. */
@@ -212,6 +220,8 @@ export interface SellerDashboard {
     created_at: string;
     earned_total: string;
     calls_total: number;
+    /** Same on-chain readiness signal as Listing.agent_object_id. */
+    agent_object_id: string | null;
   }>;
   earnings: { last_7d: string; last_30d: string; all_time: string; calls_7d: number };
 }
@@ -555,6 +565,87 @@ export const api = {
           runs_remaining: number; max_per_run_micro: number;
           next_run_ts: number; last_run_ts: number | null;
           cancelled_at: string | null;
+          // v2 escrow fields. Older API responses omit them — the FE
+          // narrows on undefined to keep backward compat with v1 rows.
+          escrow_remaining_micro?: string;
+          total_escrowed_micro?: string;
+          package_version?: number;
+          status?: 'active' | 'stopped' | 'cancelled' | 'exhausted';
+        }>;
+      }>;
+    }),
+
+  /**
+   * v2 escrow create — backend returns a buyer-signable PTB envelope. The FE
+   * signs + executes via dapp-kit, then calls `confirmSubscription` so
+   * /activity reflects the new hire instantly (indexer would otherwise
+   * lag by one event sweep).
+   *
+   * Echoes the resolved on-chain `agent_object_id` so the FE never needs to
+   * know whether it sent a slug or a real Sui id — the canonical id flows
+   * back from the API and is stored in `loop_subscriptions.agent_id`.
+   */
+  buildCreateEscrowPtb: (wallet: string, body: {
+    agent_object_id: string; template_walrus_blob_id: string;
+    area_slug?: string; cron_utc_minute: number; runs: number;
+    max_per_run_micro: number; budget_coin_object_id: string;
+  }) =>
+    authedJson<{
+      ok: true; ptb_bytes_b64: string; total_escrow_micro: string;
+      package_version: 2; agent_object_id: string;
+    }>(
+      'POST', '/v3/loop/subscriptions', wallet, body,
+    ),
+
+  /**
+   * Idempotent post-sign confirm. Pass the on-chain `WorkflowEscrow<T>`
+   * shared object id derived from the signed-tx effects so the optimistic
+   * row in /activity matches the real chain object.
+   */
+  confirmSubscription: (wallet: string, body: {
+    subscription_object_id: string; agent_id: string;
+    template_walrus_blob_id: string; area_slug?: string;
+    cron_utc_minute: number; runs: number; max_per_run_micro: number;
+    total_escrow_micro: string;
+  }) =>
+    authedJson<{ ok: true }>('POST', '/v3/loop/subscriptions/confirm', wallet, body),
+
+  /** v2 escrow top-up PTB build. */
+  buildTopUpPtb: (wallet: string, subscription_object_id: string, body: {
+    runs_to_add: number; budget_coin_object_id: string;
+  }) =>
+    authedJson<{ ok: true; ptb_bytes_b64: string; added_micro: string }>(
+      'POST', `/v3/loop/subscriptions/${encodeURIComponent(subscription_object_id)}/top-up`, wallet, body,
+    ),
+
+  /**
+   * v2 escrow cancel — returns `{ ptb_bytes_b64 }` for v2 rows or `{ ok: true }`
+   * for legacy v1 rows. The FE checks for `ptb_bytes_b64` and signs only when
+   * present.
+   */
+  buildCancelSubscription: (wallet: string, subscription_object_id: string) =>
+    authedJson<{ ok: true; ptb_bytes_b64?: string }>(
+      'POST', `/v3/loop/subscriptions/${encodeURIComponent(subscription_object_id)}/cancel`, wallet, {},
+    ),
+
+  /** Seller view — per-subscription rows for the seller's ACTIVE_HIRES panel. */
+  sellerAgentSubscribers: (wallet: string, agentSlugOrId: string) =>
+    fetch(`${AGENT_BACKEND_URL}/v3/loop/seller/agents/${encodeURIComponent(agentSlugOrId)}/subscribers`, {
+      headers: { 'x-wallet-address': wallet },
+      cache: 'no-store',
+    }).then(async (r) => {
+      if (r.status === 404 || r.status === 403) return { subscribers: [] };
+      if (!r.ok) throw new Error(`subscribers ${r.status}`);
+      return r.json() as Promise<{
+        subscribers: Array<{
+          subscription_object_id: string; agent_id: string; buyer_addr: string;
+          area_slug: string | null; cron_utc_minute: number;
+          runs_remaining: number; max_per_run_micro: string;
+          next_run_ts: string; last_run_ts: string | null;
+          cancelled_at: string | null;
+          escrow_remaining_micro: string; total_escrowed_micro: string;
+          package_version: number; created_at: string;
+          status: 'active' | 'stopped' | 'cancelled' | 'exhausted';
         }>;
       }>;
     }),

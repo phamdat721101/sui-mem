@@ -74,6 +74,7 @@ export class WorkflowSchedulerCron implements ScheduledCron {
          FROM loop_subscriptions
         WHERE cancelled_at IS NULL
           AND runs_remaining > 0
+          AND escrow_remaining_micro >= max_per_run_micro
           AND next_run_ts <= $1
         ORDER BY next_run_ts ASC
         LIMIT ${TICK_BATCH}`,
@@ -89,9 +90,10 @@ export class WorkflowSchedulerCron implements ScheduledCron {
         const next_ts = computeNextRun(now, sub.cron_utc_minute);
         await this.deps.pool.query(
           `UPDATE loop_subscriptions
-              SET runs_remaining = runs_remaining - 1,
-                  last_run_ts    = $1,
-                  next_run_ts    = $2
+              SET runs_remaining         = runs_remaining - 1,
+                  escrow_remaining_micro = GREATEST(0, escrow_remaining_micro - max_per_run_micro),
+                  last_run_ts            = $1,
+                  next_run_ts            = $2
             WHERE id = $3`,
           [now.getTime(), next_ts, sub.id],
         );

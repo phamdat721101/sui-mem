@@ -1,0 +1,16 @@
+[package]
+name = "fhe_brain_loop_v2"
+edition = "2024.beta"
+version = "0.1.0"
+
+# v2 escrow primitive — buyer-deposit-on-hire + top_up.
+#
+# Sibling package to `fhe_brain` (decision 1=b in the workflow-escrow PRD).
+# Imports `Agent` + `RunnerCap` types from the existing fhe_brain package via
+# the local-path dep so type identity is preserved across upgrades.
+
+[dependencies]
+fhe_brain = { local = "../sui-contracts" }
+
+[addresses]
+fhe_brain_loop_v2 = "0x0"

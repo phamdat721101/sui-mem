@@ -46,6 +46,7 @@ import { ArtifactVaultService } from '../services/loop/artifactVaultService';
 import { BuyerPreferenceProfileService } from '../services/loop/buyerPreferenceProfile';
 import { RightToForgetService } from '../services/loop/rightToForgetService';
 import { computeNextRun } from '../services/loop/workflowScheduler';
+import { deriveStatus } from '../services/loop/escrowStatus';
 import {
   synthesizeWorkflow,
   type Category,
@@ -406,6 +407,12 @@ async function verifyAgentOwner(agentIdOrSlug: string, wallet: string): Promise<
 }
 
 // ─── Daily-run subscription endpoints ────────────────────────────────────
+//
+// PRD `workflow-escrow` (decision 1=b): new hires use the v2 escrow package;
+// legacy LoopSubscription rows stay readable. Status derivation lives in
+// services/loop/escrowStatus.ts so cron + buyer + seller all agree.
+
+const LOOP_V2_PACKAGE_ID = process.env.OPENX_LOOP_V2_PACKAGE_ID ?? '';
 
 router.post('/subscriptions', async (req: AuthRequest, res: Response) => {
   const wallet = req.user?.address;
@@ -428,73 +435,310 @@ router.post('/subscriptions', async (req: AuthRequest, res: Response) => {
   if (!Number.isFinite(b.max_per_run_micro) || b.max_per_run_micro < 0) {
     return res.status(400).json({ error: 'max_per_run_micro must be >= 0' });
   }
+  if (!LOOP_V2_PACKAGE_ID || !USDC_COIN_TYPE) {
+    return res.status(503).json({ error: 'loop_v2_not_configured' });
+  }
+  if (!b.budget_coin_object_id || b.budget_coin_object_id.startsWith('pending-')) {
+    return res.status(400).json({ error: 'budget_coin_object_id required (real Sui coin object id)' });
+  }
 
-  // Persist to operational cache. Real on-chain LoopSubscription<T> object id
-  // arrives once the SDK PTB builder lands; until then we use a deterministic
-  // stub keyed by (wallet, ts, agent) so /activity shows the row.
-  const subscription_object_id =
-    `stub-${Date.now()}-${wallet.slice(2, 10)}-${b.agent_object_id.slice(0, 8)}`;
-  const next_run_ts = computeNextRun(new Date(), b.cron_utc_minute);
+  // Map slug / uuid → on-chain Agent shared object id BEFORE building the PTB.
+  // Without this, `tx.object("research-agent")` silently normalizes the unknown
+  // string into the all-zeros Sui address and the Move VM aborts with
+  // `Invalid Sui Object id 0x000…`. SOLID-DIP: a single resolver, one DB hop,
+  // every PTB-building route shares it.
+  const resolvedAgentId = await resolveAgentObjectId(b.agent_object_id);
+  if (!resolvedAgentId) {
+    return res.status(404).json({
+      error: 'agent_not_found_or_unpublished',
+      detail: `No on-chain Agent for "${b.agent_object_id}". The agent must be published (LoopAgentPublished event indexed) before buyers can hire it.`,
+    });
+  }
+
+  // Build buyer-signed PTB calling openx_workflow_escrow::create_escrow.
+  // The buyer's coin must hold >= runs * max_per_run µUSDC. We split exactly
+  // that off so the remainder stays with the buyer; no operator key needed.
+  const tx = new Transaction();
+  const total = BigInt(b.runs) * BigInt(b.max_per_run_micro);
+  const [escrowCoin] = tx.splitCoins(
+    tx.object(b.budget_coin_object_id),
+    [tx.pure.u64(total)],
+  );
+  tx.moveCall({
+    target: `${LOOP_V2_PACKAGE_ID}::openx_workflow_escrow::create_escrow`,
+    typeArguments: [USDC_COIN_TYPE],
+    arguments: [
+      tx.object(resolvedAgentId),
+      tx.pure.vector('u8', Array.from(Buffer.from(b.template_walrus_blob_id, 'utf8'))),
+      tx.pure.vector('u8', Array.from(Buffer.from(b.area_slug ?? '', 'utf8'))),
+      tx.pure.u32(b.cron_utc_minute),
+      tx.pure.u32(b.runs),
+      tx.pure.u64(b.max_per_run_micro),
+      escrowCoin,
+      tx.object('0x6'),  // Clock
+    ],
+  });
+  tx.setSender(wallet);
 
   try {
-    const r = await pool.query<{ id: number }>(
-      `INSERT INTO loop_subscriptions
-            (subscription_object_id, agent_id, buyer_addr, template_walrus_blob_id,
-             area_slug, cron_utc_minute, runs_remaining, max_per_run_micro, next_run_ts)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING id`,
-      [
-        subscription_object_id, b.agent_object_id, wallet, b.template_walrus_blob_id,
-        b.area_slug ?? null, b.cron_utc_minute, b.runs, b.max_per_run_micro, next_run_ts,
-      ],
-    );
-    return res.status(201).json({
+    const ptbBytes = await tx.build({ client: suiClient() });
+    return res.json({
       ok: true,
-      subscription: {
-        id: r.rows[0].id,
-        subscription_object_id,
-        agent_id: b.agent_object_id,
-        runs_remaining: b.runs,
-        next_run_ts,
-        cron_utc_minute: b.cron_utc_minute,
-        area_slug: b.area_slug ?? null,
-      },
+      ptb_bytes_b64: Buffer.from(ptbBytes).toString('base64'),
+      total_escrow_micro: total.toString(),
+      package_version: 2,
+      // Echo the resolved id back so the FE's `confirmSubscription` mirror
+      // stores the canonical agent_object_id, not the slug it sent in.
+      agent_object_id: resolvedAgentId,
     });
   } catch (e) {
-    logger.error({ err: (e as Error).message }, 'subscribe:insert_failed');
-    return res.status(500).json({ error: 'subscribe_failed', detail: (e as Error).message });
+    logger.error({ err: (e as Error).message }, 'subscribe:ptb_build_failed');
+    return res.status(500).json({ error: 'ptb_build_failed', detail: (e as Error).message });
   }
 });
 
+/**
+ * POST /v3/loop/subscriptions/:id/top-up
+ *
+ * Buyer-signed PTB calling openx_workflow_escrow::top_up. `id` is the
+ * subscription_object_id (the live `WorkflowEscrow<T>` shared object).
+ * The supplied coin must hold >= `runs_to_add * max_per_run_micro`; we
+ * split that exact amount off in the same PTB so the remainder stays with
+ * the buyer. Schedule is not reset — top_up only refills budget.
+ *
+ * Authz: the FE attaches x-wallet-address; the Move entry function asserts
+ * `buyer == ctx.sender()` so on-chain proof is canonical regardless of the
+ * API check. We still validate the row in our DB to fail fast with a 404
+ * instead of building an invalid PTB.
+ */
+router.post('/subscriptions/:id/top-up', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const id = String(req.params.id ?? '');
+  const b = req.body as { runs_to_add: number; budget_coin_object_id: string };
+  if (!Number.isInteger(b.runs_to_add) || b.runs_to_add < 1 || b.runs_to_add > 366) {
+    return res.status(400).json({ error: 'runs_to_add must be 1..366' });
+  }
+  if (!b.budget_coin_object_id || b.budget_coin_object_id.startsWith('pending-')) {
+    return res.status(400).json({ error: 'budget_coin_object_id required' });
+  }
+  if (!LOOP_V2_PACKAGE_ID || !USDC_COIN_TYPE) {
+    return res.status(503).json({ error: 'loop_v2_not_configured' });
+  }
+
+  const r = await pool.query<{ max_per_run_micro: string; cancelled_at: Date | null; package_version: number }>(
+    `SELECT max_per_run_micro, cancelled_at, package_version
+       FROM loop_subscriptions
+      WHERE subscription_object_id = $1 AND buyer_addr = $2 LIMIT 1`,
+    [id, wallet],
+  );
+  if (!r.rowCount) return res.status(404).json({ error: 'subscription_not_found' });
+  const row = r.rows[0];
+  if (row.cancelled_at) return res.status(409).json({ error: 'already_cancelled' });
+  if (row.package_version !== 2) {
+    return res.status(409).json({ error: 'top_up_unsupported_on_legacy_subscription' });
+  }
+
+  const needed = BigInt(b.runs_to_add) * BigInt(row.max_per_run_micro);
+  const tx = new Transaction();
+  const [topUpCoin] = tx.splitCoins(
+    tx.object(b.budget_coin_object_id),
+    [tx.pure.u64(needed)],
+  );
+  tx.moveCall({
+    target: `${LOOP_V2_PACKAGE_ID}::openx_workflow_escrow::top_up`,
+    typeArguments: [USDC_COIN_TYPE],
+    arguments: [
+      tx.object(id),
+      tx.pure.u32(b.runs_to_add),
+      topUpCoin,
+    ],
+  });
+  tx.setSender(wallet);
+
+  try {
+    const ptbBytes = await tx.build({ client: suiClient() });
+    return res.json({
+      ok: true,
+      ptb_bytes_b64: Buffer.from(ptbBytes).toString('base64'),
+      added_micro: needed.toString(),
+    });
+  } catch (e) {
+    logger.error({ err: (e as Error).message, id }, 'topup:ptb_build_failed');
+    return res.status(500).json({ error: 'ptb_build_failed', detail: (e as Error).message });
+  }
+});
+
+/**
+ * POST /v3/loop/subscriptions/:id/cancel
+ *
+ * Two-mode response so the FE can do the right thing for both packages:
+ *   • package_version=2 → returns `{ ptb_bytes_b64 }` for the buyer to sign
+ *     `openx_workflow_escrow::cancel_escrow`. The on-chain refund is the
+ *     source of truth; the indexer flips `cancelled_at` after confirmation.
+ *   • package_version=1 → legacy stub, no on-chain primitive — flips
+ *     `cancelled_at` directly in DB. Same response shape (`{ ok: true }`)
+ *     as the historical contract so existing FE keeps working.
+ */
 router.post('/subscriptions/:id/cancel', async (req: AuthRequest, res: Response) => {
   const wallet = req.user?.address;
   if (!wallet) return res.status(401).json({ error: 'wallet_required' });
-  const r = await pool.query<{ id: number; runs_remaining: number; max_per_run_micro: string }>(
+  const id = String(req.params.id ?? '');
+
+  const lookup = await pool.query<{ package_version: number; cancelled_at: Date | null }>(
+    `SELECT package_version, cancelled_at
+       FROM loop_subscriptions
+      WHERE subscription_object_id = $1 AND buyer_addr = $2 LIMIT 1`,
+    [id, wallet],
+  );
+  if (!lookup.rowCount) {
+    return res.status(404).json({ error: 'subscription_not_found' });
+  }
+  if (lookup.rows[0].cancelled_at) {
+    return res.status(409).json({ error: 'already_cancelled' });
+  }
+
+  // v2: hand back a PTB the buyer signs (refund hits the wallet on-chain).
+  if (lookup.rows[0].package_version === 2) {
+    if (!LOOP_V2_PACKAGE_ID || !USDC_COIN_TYPE) {
+      return res.status(503).json({ error: 'loop_v2_not_configured' });
+    }
+    const tx = new Transaction();
+    tx.moveCall({
+      target: `${LOOP_V2_PACKAGE_ID}::openx_workflow_escrow::cancel_escrow`,
+      typeArguments: [USDC_COIN_TYPE],
+      arguments: [tx.object(id), tx.object('0x6')],
+    });
+    tx.setSender(wallet);
+    try {
+      const ptbBytes = await tx.build({ client: suiClient() });
+      return res.json({
+        ok: true,
+        ptb_bytes_b64: Buffer.from(ptbBytes).toString('base64'),
+        cancelled: { subscription_object_id: id },
+      });
+    } catch (e) {
+      logger.error({ err: (e as Error).message, id }, 'cancel:ptb_build_failed');
+      return res.status(500).json({ error: 'ptb_build_failed', detail: (e as Error).message });
+    }
+  }
+
+  // v1 (legacy stub): direct DB flip, no on-chain action.
+  await pool.query(
     `UPDATE loop_subscriptions
         SET cancelled_at   = now(),
             runs_remaining = 0
       WHERE subscription_object_id = $1
         AND buyer_addr            = $2
-        AND cancelled_at IS NULL
-   RETURNING id, runs_remaining, max_per_run_micro`,
-    [req.params.id, wallet],
+        AND cancelled_at IS NULL`,
+    [id, wallet],
   );
-  if (!r.rowCount) return res.status(404).json({ error: 'subscription_not_found_or_already_cancelled' });
-  res.json({ ok: true, cancelled: { subscription_object_id: req.params.id } });
+  res.json({ ok: true, cancelled: { subscription_object_id: id } });
 });
 
 router.get('/subscriptions', async (req: AuthRequest, res: Response) => {
   const wallet = req.user?.address;
   if (!wallet) return res.status(401).json({ error: 'wallet_required' });
-  const r = await pool.query(
+  const r = await pool.query<{
+    subscription_object_id: string; agent_id: string; area_slug: string | null;
+    cron_utc_minute: number; runs_remaining: number; max_per_run_micro: string;
+    next_run_ts: string; last_run_ts: string | null; cancelled_at: Date | null;
+    escrow_remaining_micro: string; total_escrowed_micro: string; package_version: number;
+  }>(
     `SELECT subscription_object_id, agent_id, area_slug, cron_utc_minute,
-            runs_remaining, max_per_run_micro, next_run_ts, last_run_ts, cancelled_at
+            runs_remaining, max_per_run_micro, next_run_ts, last_run_ts, cancelled_at,
+            escrow_remaining_micro, total_escrowed_micro, package_version
        FROM loop_subscriptions
       WHERE buyer_addr = $1
       ORDER BY created_at DESC LIMIT 50`,
     [wallet],
   );
-  res.json({ subscriptions: r.rows });
+  const subscriptions = r.rows.map((row) => ({
+    ...row,
+    status: deriveStatus(row),
+  }));
+  res.json({ subscriptions });
+});
+
+/**
+ * POST /v3/loop/subscriptions/confirm
+ *
+ * Called by the FE *after* the buyer signs + executes the create_escrow PTB.
+ * Inserts an optimistic row into `loop_subscriptions` (package_version=2) so
+ * /activity shows the new hire in the same tick. The real-time event indexer
+ * will overwrite the row with on-chain truth on its next sweep — this is
+ * just a UX latency hider.
+ *
+ * Idempotent: if the row already exists (indexer beat us), update fields.
+ */
+router.post('/subscriptions/confirm', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const b = req.body as {
+    subscription_object_id: string; agent_id: string;
+    template_walrus_blob_id: string; area_slug?: string;
+    cron_utc_minute: number; runs: number; max_per_run_micro: number;
+    total_escrow_micro: string;
+  };
+  if (!b.subscription_object_id || !b.agent_id) {
+    return res.status(400).json({ error: 'subscription_object_id + agent_id required' });
+  }
+  const next_run_ts = computeNextRun(new Date(), b.cron_utc_minute);
+  await pool.query(
+    `INSERT INTO loop_subscriptions
+          (subscription_object_id, agent_id, buyer_addr, template_walrus_blob_id,
+           area_slug, cron_utc_minute, runs_remaining, max_per_run_micro,
+           next_run_ts, escrow_remaining_micro, total_escrowed_micro, package_version)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, 2)
+     ON CONFLICT (subscription_object_id) DO UPDATE
+        SET runs_remaining         = EXCLUDED.runs_remaining,
+            escrow_remaining_micro = EXCLUDED.escrow_remaining_micro,
+            total_escrowed_micro   = EXCLUDED.total_escrowed_micro,
+            package_version        = 2`,
+    [
+      b.subscription_object_id, b.agent_id, wallet, b.template_walrus_blob_id,
+      b.area_slug ?? null, b.cron_utc_minute, b.runs, b.max_per_run_micro,
+      next_run_ts, b.total_escrow_micro,
+    ],
+  );
+  res.json({ ok: true });
+});
+
+/**
+ * GET /v3/loop/seller/agents/:id/subscribers
+ *
+ * Owner-gated. Per-subscription rows for the seller's settings ACTIVE_HIRES
+ * panel. Each row carries the same `status` derivation as buyer's /activity
+ * so what the seller sees matches what the buyer sees.
+ */
+router.get('/seller/agents/:id/subscribers', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  if (!(await verifyAgentOwner(req.params.id, wallet))) {
+    return res.status(403).json({ error: 'not_agent_owner' });
+  }
+  const r = await pool.query<{
+    subscription_object_id: string; agent_id: string; buyer_addr: string;
+    area_slug: string | null; cron_utc_minute: number;
+    runs_remaining: number; max_per_run_micro: string;
+    next_run_ts: string; last_run_ts: string | null; cancelled_at: Date | null;
+    escrow_remaining_micro: string; total_escrowed_micro: string;
+    package_version: number; created_at: Date;
+  }>(
+    `SELECT subscription_object_id, agent_id, buyer_addr, area_slug, cron_utc_minute,
+            runs_remaining, max_per_run_micro, next_run_ts, last_run_ts, cancelled_at,
+            escrow_remaining_micro, total_escrowed_micro, package_version, created_at
+       FROM loop_subscriptions
+      WHERE agent_id = $1
+      ORDER BY created_at DESC LIMIT 100`,
+    [req.params.id],
+  );
+  res.json({
+    subscribers: r.rows.map((row) => ({
+      ...row,
+      status: deriveStatus(row),
+    })),
+  });
 });
 
 // ─── Upgrade wizard (existing-agent → workflow-aware brain) ──────────────
@@ -1191,6 +1435,25 @@ async function loadAgentSuiObjectId(idOrSlug: string): Promise<string | null> {
     [idOrSlug],
   );
   return r.rows[0]?.agent_object_id ?? null;
+}
+
+/**
+ * Normalize an agent reference (Sui object id OR human slug OR uuid) to a
+ * canonical on-chain Agent shared object id.
+ *
+ * SOLID-DIP: routes never decide "is this a slug?" themselves. They feed
+ * whatever the URL/body carries into this resolver and get back either the
+ * 0x+64-hex Sui object id or `null`. Returning `null` lets callers send a
+ * useful 404 instead of building a PTB with `0x000…000` (the silent
+ * normalization Sui's SDK does for unknown strings — that's exactly what
+ * caused the `ptb_build_failed: Invalid Sui Object id 0x000…` error before
+ * this fix).
+ */
+async function resolveAgentObjectId(idOrSlug: string): Promise<string | null> {
+  if (!idOrSlug) return null;
+  // Already a real Sui object id — pass through, no DB hop.
+  if (/^0x[0-9a-fA-F]{64}$/.test(idOrSlug)) return idOrSlug;
+  return loadAgentSuiObjectId(idOrSlug);
 }
 
 /** Build a mutation PTB and return its bytes for the FE to sign. */

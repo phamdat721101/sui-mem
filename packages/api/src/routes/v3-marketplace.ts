@@ -38,6 +38,29 @@ const VALID_TIERS = new Set(['basic', 'verified', 'tee_attested']);
  */
 const SUI_CHAINS = ['sui', 'sui-testnet', 'sui-mainnet'];
 
+/**
+ * Single SQL fragment that resolves an agent's on-chain `Agent` shared
+ * object id by joining the indexer's `LoopAgentPublished` event for the
+ * row's publish tx_digest. Returns NULL when the agent isn't yet on-chain
+ * (off-chain `agents.published = true` but no indexed event yet).
+ *
+ * Plugged into every listing-shaped SELECT so consumers see a single
+ * boolean truth — eliminates the "agent shows in marketplace but Hire
+ * fails with `agent_not_found_or_unpublished`" footgun.
+ *
+ * Performance: index-only via agents.fee_tx_digest (migration 036) and
+ * agent_events UNIQUE(tx_digest, seq_in_tx). LIMIT 1 keeps it constant-time.
+ */
+const ON_CHAIN_AGENT_ID_LATERAL = `
+  LEFT JOIN LATERAL (
+    SELECT ae.agent_object_id
+      FROM agent_events ae
+     WHERE ae.tx_digest = a.fee_tx_digest
+       AND ae.event_type = 'LoopAgentPublished'
+     ORDER BY ae.timestamp_ms ASC LIMIT 1
+  ) ae_pub ON TRUE
+`;
+
 // ─── Public catalog ────────────────────────────────────────────────────────
 
 router.get('/listings', async (req: Request, res: Response) => {
@@ -60,9 +83,11 @@ router.get('/listings', async (req: Request, res: Response) => {
   const r = await pool.query(
     `SELECT a.id, a.brain_id, a.slug, a.chain, a.domain, a.short_description,
             a.verification_tier, a.pricing, a.persona, a.created_at,
-            b.title, b.description, b.tags
+            b.title, b.description, b.tags,
+            ae_pub.agent_object_id
        FROM agents a
        JOIN brains b ON b.id = a.brain_id
+       ${ON_CHAIN_AGENT_ID_LATERAL}
        ${where}
    ORDER BY a.created_at DESC
       LIMIT $1 OFFSET $2`,
@@ -86,9 +111,11 @@ router.get('/listings/:slug', async (req: Request, res: Response) => {
   const r = await pool.query(
     `SELECT a.id, a.brain_id, a.slug, a.chain, a.domain, a.short_description,
             a.verification_tier, a.pricing, a.persona, a.created_at,
-            b.title, b.description, b.tags
+            b.title, b.description, b.tags,
+            ae_pub.agent_object_id
        FROM agents a
        JOIN brains b ON b.id = a.brain_id
+       ${ON_CHAIN_AGENT_ID_LATERAL}
       WHERE a.slug = $1 AND a.published = true AND a.chain = ANY($2::text[])
       LIMIT 1`,
     [slug, SUI_CHAINS],
@@ -172,12 +199,14 @@ router.get('/seller/dashboard', async (req: AuthRequest, res: Response) => {
   const [agents, earnings] = await Promise.all([
     pool.query(
       `SELECT a.id, a.slug, a.domain, a.verification_tier, a.created_at,
+              ae_pub.agent_object_id,
               COALESCE(SUM(pc.amount_usdc), 0)::text AS earned_total,
               COUNT(pc.id)::int                      AS calls_total
          FROM agents a
          LEFT JOIN paid_calls pc ON pc.agent_id = a.id
+         ${ON_CHAIN_AGENT_ID_LATERAL}
         WHERE a.seller_id = $1 AND a.chain = ANY($2::text[])
-     GROUP BY a.id
+     GROUP BY a.id, ae_pub.agent_object_id
      ORDER BY a.created_at DESC`,
       [sellerId, SUI_CHAINS],
     ),
