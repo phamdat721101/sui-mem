@@ -1,0 +1,42 @@
+{
+  "id": "S5",
+  "title": "Make-it-safe — RTF + persona-approve + key-rotate",
+  "assertions": [
+    {
+      "name": "buildDeletePerBuyerMemoryPtb requires cooling_off_days ≥ 7",
+      "verdict": "fail",
+      "evidence": {
+        "error": "Invalid input: Received \"0x0000000000000000000000000000000000000000000000000000000000runner\"",
+        "stack": "ValiError: Invalid input: Received \"0x0000000000000000000000000000000000000000000000000000000000runner\"\n    at parse (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/node_modules/valibot/dist/index.cjs:7381:28)\n    at TransactionDataBuilder.snapshot (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/TransactionData.ts:445:10)\n    at _Transaction.getData (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/Transaction.ts:318:21)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:417:49)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:403:11)"
+      },
+      "ms": 2
+    },
+    {
+      "name": "buildPersonaApprovePtb produces update_extension PTB; rejects missing blob id",
+      "verdict": "fail",
+      "evidence": {
+        "error": "Invalid input: Received \"0x0000000000000000000000000000000000000000000000000000000000000ext\"",
+        "stack": "ValiError: Invalid input: Received \"0x0000000000000000000000000000000000000000000000000000000000000ext\"\n    at parse (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/node_modules/valibot/dist/index.cjs:7381:28)\n    at TransactionDataBuilder.snapshot (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/TransactionData.ts:445:10)\n    at _Transaction.getData (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/Transaction.ts:318:21)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:437:49)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:423:11)"
+      },
+      "ms": 1
+    },
+    {
+      "name": "buildRotateDelegatePtb rejects same-pubkey rotation + accepts valid rotate",
+      "verdict": "fail",
+      "evidence": {
+        "error": "Invalid input: Received \"0x000000000000000000000000000000000000000000000000000000000000000p\"",
+        "stack": "ValiError: Invalid input: Received \"0x000000000000000000000000000000000000000000000000000000000000000p\"\n    at parse (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/node_modules/valibot/dist/index.cjs:7381:28)\n    at TransactionDataBuilder.snapshot (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/TransactionData.ts:445:10)\n    at _Transaction.getData (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/Transaction.ts:318:21)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:457:49)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:443:11)"
+      },
+      "ms": 2
+    },
+    {
+      "name": "subscription create + cancel builders match Move targets + type args",
+      "verdict": "fail",
+      "evidence": {
+        "error": "Invalid input: Received \"0x000000000000000000000000000000000000000000000000000000000000coin\"",
+        "stack": "ValiError: Invalid input: Received \"0x000000000000000000000000000000000000000000000000000000000000coin\"\n    at parse (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/node_modules/valibot/dist/index.cjs:7381:28)\n    at TransactionDataBuilder.snapshot (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/TransactionData.ts:445:10)\n    at _Transaction.getData (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/Transaction.ts:318:21)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:471:54)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:463:11)"
+      },
+      "ms": 2
+    }
+  ]
+}

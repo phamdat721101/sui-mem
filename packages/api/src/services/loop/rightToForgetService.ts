@@ -27,6 +27,15 @@ export interface RtfDeps {
   logger: Logger;
   /** Called by cron after Sui PTB succeeds — purges Postgres mirror. */
   purgeNamespaces?: (namespaces: string[]) => Promise<void>;
+  /** PRD-X6 — when present, RTF cron submits an operator-signed
+   *  `delete_per_buyer_memory` PTB after the 7-day cooling off and BEFORE
+   *  the Postgres + MemWal purge. Returns the tx digest, which becomes the
+   *  audit-grade `RightToForgetEmitted` event proof. */
+  submitOnChainDelete?: (args: {
+    agent_id: string;
+    buyer_addr: string;
+    cooling_off_days: number;
+  }) => Promise<string>;
   enabled: () => boolean;
 }
 
@@ -113,20 +122,45 @@ export class RightToForgetService implements ScheduledCron {
     const ns_l4 = perBuyerNamespace(4, req.agent_id, req.buyer_addr);
     const ns_l5 = perBuyerNamespace(5, req.agent_id, req.buyer_addr);
 
-    // 1. Postgres mirror delete (idempotent).
+    // 1. PRD-X6 — operator-signed Move call FIRST. Emits
+    //    `RightToForgetEmitted` on-chain so the audit trail exists even
+    //    if the postgres delete (step 2) crashes mid-run. Idempotent on
+    //    the request_id check below.
+    let onchain_tx_digest: string | null = null;
+    if (this.deps.submitOnChainDelete) {
+      try {
+        onchain_tx_digest = await this.deps.submitOnChainDelete({
+          agent_id: req.agent_id,
+          buyer_addr: req.buyer_addr,
+          cooling_off_days: COOLING_OFF_DAYS,
+        });
+        this.deps.logger.info(
+          { request_id: req.id, agent_id: req.agent_id, digest: onchain_tx_digest },
+          'rtf:executed:onchain',
+        );
+      } catch (e) {
+        this.deps.logger.error(
+          { request_id: req.id, err: (e as Error).message },
+          'rtf:onchain_submit_failed_skip',
+        );
+        // Skip the postgres purge — without on-chain proof we don't burn
+        // the row; cron will retry next tick.
+        return;
+      }
+    }
+
+    // 2. Postgres mirror delete (idempotent).
     await this.deps.pool.query(
       `DELETE FROM cognitive_memories WHERE namespace IN ($1, $2)`,
       [ns_l4, ns_l5],
     );
 
-    // 2. MemWal namespace purge (delegated). Sui Move entry
-    //    `delete_per_buyer_memory<T>` is called by the route handler /
-    //    cron driver since it needs sponsor signing.
+    // 3. MemWal namespace purge (delegated to operator pool).
     if (this.deps.purgeNamespaces) {
       await this.deps.purgeNamespaces([ns_l4, ns_l5]);
     }
 
-    // 3. Mark executed.
+    // 4. Mark executed.
     await this.deps.pool.query(
       `UPDATE right_to_forget_requests
           SET status = 'executed', executed_at = now()

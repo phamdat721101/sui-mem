@@ -66,6 +66,16 @@ export interface SellerPublishInput {
   /** Sui tx digest of the on-chain $1 USDC publish-fee payment. Optional
    *  for legacy publishes; required for v2 on-chain publishes. */
   fee_tx_digest?: string;
+  /** PRD-X2 — agent kind. Defaults to 'api' for back-compat with the
+   *  legacy single-form wizard. 'workflow' requires the 3 fields below. */
+  kind?: 'api' | 'workflow' | 'skill';
+  /** Walrus blob id of the workflow YAML; required when kind='workflow'. */
+  workflow_walrus_blob_id?: string;
+  /** PARA areas (1..16) declared at publish time; required when kind='workflow'. */
+  area_slugs?: string[];
+  /** Seller's `AgentV11Extension` shared object id from the upgrade PTB.
+   *  Persists as a hot-path Postgres column for marketplace listing reads. */
+  agent_v11_extension_object_id?: string;
 }
 
 export interface SellerPublishResult {
@@ -131,6 +141,22 @@ function validate(input: SellerPublishInput): void {
   }
   if (input.fee_tx_digest !== undefined && typeof input.fee_tx_digest !== 'string') {
     throw httpErr('fee_tx_digest must be a string', 400);
+  }
+  // PRD-X2 — kind=workflow validation. kind defaults to 'api' (legacy).
+  const kind = input.kind ?? 'api';
+  if (!['api', 'workflow', 'skill'].includes(kind)) {
+    throw httpErr(`invalid kind (allowed: api | workflow | skill)`, 400);
+  }
+  if (kind === 'skill') {
+    throw httpErr('kind=skill not yet supported (PRD-15 deferred)', 400);
+  }
+  if (kind === 'workflow') {
+    if (!input.workflow_walrus_blob_id) {
+      throw httpErr('workflow_walrus_blob_id required when kind=workflow', 400);
+    }
+    if (!Array.isArray(input.area_slugs) || input.area_slugs.length === 0 || input.area_slugs.length > 16) {
+      throw httpErr('area_slugs must be 1..16 entries when kind=workflow', 400);
+    }
   }
 }
 
@@ -223,20 +249,24 @@ export async function publish(
     const brainId = brainRes.rows[0].id as number;
 
     // §3 — Agent INSERT.
+    const kind = input.kind ?? 'api';
     const agentRes = await client.query(
       `INSERT INTO agents (
          brain_id, owner_address, chain, persona, pricing,
          published, slug, domain, short_description, verification_tier,
-         manifest_yaml, manifest_hash, seller_id, fee_tx_digest
+         manifest_yaml, manifest_hash, seller_id, fee_tx_digest,
+         kind, workflow_walrus_blob_id
        )
        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb,
                true, $6, $7, $8, $9,
-               $10, $11, $12, $13)
+               $10, $11, $12, $13,
+               $14, $15)
        RETURNING id`,
       [
         brainId, owner, chain, JSON.stringify(persona), JSON.stringify(pricing),
         slug, input.domain, input.short_description, tier,
         manifestYaml, manifestHash, sellerId, input.fee_tx_digest ?? null,
+        kind, input.workflow_walrus_blob_id ?? null,
       ],
     );
     const agentId = agentRes.rows[0].id as string;

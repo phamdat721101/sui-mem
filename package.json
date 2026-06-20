@@ -34,6 +34,7 @@
     "smoke:agent-workspace-e2e": "tsx scripts/smoke-agent-workspace-e2e.ts",
     "smoke:agent-training-e2e": "tsx scripts/smoke-agent-training-e2e.ts",
     "smoke:workflow-v1-1": "npx tsx scripts/smoke-workflow-v1-1.ts",
+    "smoke:make-it-x": "npx tsx scripts/smoke-make-it-x-scenarios.ts",
     "backfill:loop-agents": "tsx scripts/backfill-loop-agents-to-memwal.ts",
     "db:migrate": "bash -c 'for f in packages/shared/migrations/*.sql; do psql \"$DATABASE_URL\" -f \"$f\" || true; done'"
   }

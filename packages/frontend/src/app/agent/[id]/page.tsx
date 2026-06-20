@@ -189,14 +189,25 @@ function ListingDetail({ listing }: { listing: Listing }) {
             <span className="material-symbols-outlined text-[14px]">play_arrow</span>
             Run a task
           </Link>
-          <RunWorkflowNowButton agentSlug={listing.slug} />
+          {/* PRD-X4 / T9 — kind-aware CTAs. Workflow agents render outcome-priced
+              CTAs (Hire workflow + Run workflow now); api-only agents stay clean.
+              `kind` is undefined/null on legacy rows → treated as 'api'. */}
+          {listing.kind === 'workflow' && listing.workflow_walrus_blob_id && (
+            <>
+              <RunWorkflowNowButton agentSlug={listing.slug} />
+              <HireWorkflowButton agentSlug={listing.slug} onChainAgentId={listing.agent_object_id} />
+              <p className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-[11px] text-on-surface-variant">
+                ✨ <span className="font-medium text-primary">Workflow agent</span> — paid per outcome,
+                not per call. Verdict + pay_bps land on-chain after each run.
+              </p>
+            </>
+          )}
           <Link
             href={`/agent/${listing.slug}/integrate`}
             className="block w-full rounded-full border border-outline-variant/40 py-2 text-center font-mono text-[10px] uppercase tracking-wider hover:border-primary/40 hover:text-primary"
           >
             For AI integrators →
           </Link>
-          <HireWorkflowButton agentSlug={listing.slug} onChainAgentId={listing.agent_object_id} />
           <CopyButton value={curl} label="Copy curl" full />
         </div>
         <div className="mt-4">

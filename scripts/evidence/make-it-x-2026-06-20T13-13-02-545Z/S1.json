@@ -1,0 +1,39 @@
+{
+  "id": "S1",
+  "title": "Make-it-true — mirror → on-chain init_extension PTB",
+  "assertions": [
+    {
+      "name": "OpenXMemWalMirror gates correctly (flag off → noop)",
+      "verdict": "pass",
+      "evidence": {
+        "kind": "noop_singleton"
+      },
+      "ms": 1
+    },
+    {
+      "name": "OpenXMemWalMirror live (flag on + env complete) instantiates real adapter wrapper",
+      "verdict": "pass",
+      "evidence": {
+        "instance_type": "OpenXMemWalMirror"
+      },
+      "ms": 0
+    },
+    {
+      "name": "buildInitExtensionPtb produces moveCall to openx_loop_workflow_v1_1::init_extension",
+      "verdict": "fail",
+      "evidence": {
+        "error": "Invalid input: Received \"0x00000000000000000000000000000000000000000000000000000000000agent\"",
+        "stack": "ValiError: Invalid input: Received \"0x00000000000000000000000000000000000000000000000000000000000agent\"\n    at parse (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/node_modules/valibot/dist/index.cjs:7381:28)\n    at TransactionDataBuilder.snapshot (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/TransactionData.ts:445:10)\n    at _Transaction.getData (/Users/phamdat/privacy/sui-memory/node_modules/@mysten/sui/src/transactions/Transaction.ts:318:21)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:175:47)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:166:9)"
+      },
+      "ms": 8
+    },
+    {
+      "name": "buildInitExtensionPtb rejects empty + oversize area_slugs",
+      "verdict": "pass",
+      "evidence": {
+        "invariant": "area_slugs in [1..16]"
+      },
+      "ms": 1
+    }
+  ]
+}

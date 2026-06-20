@@ -116,6 +116,12 @@ export interface Listing {
    * `agent_not_found_or_unpublished` 404 mid-flow).
    */
   agent_object_id: string | null;
+  /** PRD-X2 / X4 — agent kind for kind-aware UX. Undefined on legacy rows
+   *  (treated as 'api'). When 'workflow' AND `workflow_walrus_blob_id` is
+   *  non-null, the buyer-side surface renders the workflow flavor (DAG +
+   *  outcome-priced CTAs) instead of the per-call x402 listing. */
+  kind?: 'api' | 'workflow' | 'skill' | null;
+  workflow_walrus_blob_id?: string | null;
 }
 
 /** A row from `GET /v3/memory/marketplace`. */
@@ -236,6 +242,11 @@ export interface PublishInput {
   pricing_amount_usdc: string;
   pricing_rails?: Array<'sui_usdc' | 'x402' | 'mpp'>;
   chain?: 'sui-testnet' | 'sui-mainnet';
+  /** PRD-X2 — defaults to 'api' (legacy back-compat). When 'workflow', the
+   *  next two fields are required by the backend validator. */
+  kind?: 'api' | 'workflow' | 'skill';
+  workflow_walrus_blob_id?: string;
+  area_slugs?: string[];
 }
 
 export interface PublishResult {

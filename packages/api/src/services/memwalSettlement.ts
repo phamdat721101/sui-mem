@@ -179,6 +179,69 @@ export class MemWalSettlementWorker {
     return r.rows;
   }
 
+  /**
+   * PRD-X9-thin — per-recall direct settlement (Plan B from PRD-X9 §4).
+   *
+   * Reuses the existing `revenue_split::distribute<T>` Move entry; no new
+   * Move module, no streaming pull, no composition policy page, no
+   * reconciliation cron in this thin slice. Operator wallet signs the
+   * distribute PTB; Coin<USDC> reaches the seller's wallet directly per
+   * call. Operator's `operator_bps` cut goes to the platform treasury.
+   *
+   * SOLID:
+   *   - SRP: one verb (settle one row). Composition with `tick` is the
+   *     caller's choice — `tick` can iterate `runDirectSettlement` per
+   *     pending row instead of `settleBatch` per brain.
+   *   - DIP: `submitDistributePtb` is constructor-injected; tests pass a
+   *     stub returning a deterministic digest. Production wires the real
+   *     operator wallet builder via `services/memwalOperator.ts`.
+   */
+  async runDirectSettlement(args: {
+    brain_sui_object_id: string;
+    seller_wallet: string;
+    amount_usdc_micro: number;
+    submitDistributePtb: (req: {
+      brain_sui_object_id: string;
+      seller: string;
+      total_micro: number;
+      operator_bps: number;
+    }) => Promise<string>;
+    /** Optional override — defaults to 30-day rolling count from Postgres. */
+    rollingCount30d?: number;
+  }): Promise<{
+    settlement_tx_hash: string;
+    seller_micro: number;
+    operator_micro: number;
+    operator_bps: number;
+  }> {
+    const rolling = args.rollingCount30d ?? await this.rollingCount30d(args.seller_wallet);
+    const operator_bps = operatorBpsFor(rolling);
+    const operator_micro = Math.floor((args.amount_usdc_micro * operator_bps) / 10_000);
+    const seller_micro = args.amount_usdc_micro - operator_micro;
+
+    const settlement_tx_hash = await args.submitDistributePtb({
+      brain_sui_object_id: args.brain_sui_object_id,
+      seller: args.seller_wallet,
+      total_micro: args.amount_usdc_micro,
+      operator_bps,
+    });
+
+    logger.info(
+      {
+        brain: args.brain_sui_object_id,
+        seller: args.seller_wallet,
+        total_micro: args.amount_usdc_micro,
+        seller_micro,
+        operator_micro,
+        operator_bps,
+        digest: settlement_tx_hash,
+      },
+      'usdc:distribute',
+    );
+
+    return { settlement_tx_hash, seller_micro, operator_micro, operator_bps };
+  }
+
   private async rollingCount30d(sellerWallet: string): Promise<number> {
     const r = await this.pool.query<{ count: string }>(
       `SELECT COUNT(*)::text AS count

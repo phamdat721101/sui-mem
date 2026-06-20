@@ -1,0 +1,57 @@
+{
+  "id": "S5",
+  "title": "Make-it-safe — RTF + persona-approve + key-rotate",
+  "assertions": [
+    {
+      "name": "buildDeletePerBuyerMemoryPtb requires cooling_off_days ≥ 7",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_workflow_v1_1::delete_per_buyer_memory",
+        "cooling_off_invariant": "days >= 7"
+      },
+      "ms": 1
+    },
+    {
+      "name": "buildPersonaApprovePtb produces update_extension PTB; rejects missing blob id",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_workflow_v1_1::update_extension"
+      },
+      "ms": 0
+    },
+    {
+      "name": "buildRotateDelegatePtb rejects same-pubkey rotation + accepts valid rotate",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_agent_registry::rotate_delegate_key"
+      },
+      "ms": 1
+    },
+    {
+      "name": "subscription create + cancel builders match Move targets + type args",
+      "verdict": "pass",
+      "evidence": {
+        "create_target": "openx_loop_subscription::create_subscription",
+        "cancel_target": "openx_loop_subscription::cancel_subscription"
+      },
+      "ms": 1
+    },
+    {
+      "name": "PRD-X8 — LlmJudgeCheckpoint never auto_approves high-risk regardless of confidence",
+      "verdict": "pass",
+      "evidence": {
+        "high_auto_approve": false,
+        "low_auto_approve": true
+      },
+      "ms": 65
+    },
+    {
+      "name": "PRD-X6 — /subscriptions/confirm + /subscriptions/:id/cancel registered",
+      "verdict": "pass",
+      "evidence": {
+        "handlers": "confirm + cancel both wired"
+      },
+      "ms": 0
+    }
+  ]
+}

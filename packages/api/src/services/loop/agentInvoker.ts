@@ -52,7 +52,10 @@ import { MemoryService, type WarmContextResult } from './memoryService';
 const RUNNER_MEM_SOFT_LIMIT_MS = 30_000;
 const MODE_A_MEMORY_FLAG = 'FEATURE_LOOP_MODE_A_MEMORY';
 
-const noopMirror = { remember: async () => null };
+// PRD-X1 — replaces legacy `{ remember: async () => null }` placeholder.
+// See services/memwalMirror.ts.
+import { getOpenXMemWalMirror } from '../memwalMirror';
+const noopMirror = getOpenXMemWalMirror();
 
 export interface AgentManifest {
   title: string;

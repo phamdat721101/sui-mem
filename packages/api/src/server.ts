@@ -53,6 +53,7 @@ import {
 import { recordWorkflowRunSideEffects } from './services/loop/workflowRunRecorder';
 import { AgentEventIndexerCron } from './services/loop/agentEventIndexer';
 import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
+import { getOpenXMemWalMirror } from './services/memwalMirror';
 
 /**
  * OpenX API — Sui-native after the EVM/Fhenix pivot.
@@ -140,7 +141,11 @@ installLifecycle(server);
 // SOLID-LSP: every cron implements `ScheduledCron`; adding a new one = one
 // `crons.push(new …Cron(…))` line below.
 
-const noopMirror = { remember: async () => null };
+// PRD-X1 — replaces the legacy `{ remember: async () => null }` placeholder.
+// `getOpenXMemWalMirror()` returns the live OpenXMemWalAdapter-backed
+// mirror when FEATURE_LOOP_MIRROR_LIVE=true, otherwise a no-op singleton
+// (byte-identical to legacy behavior). See services/memwalMirror.ts.
+const noopMirror = getOpenXMemWalMirror();
 
 const personaSynth = {
   /**

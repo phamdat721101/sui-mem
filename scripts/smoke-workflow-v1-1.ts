@@ -235,6 +235,53 @@ const sce = new StopConditionEvaluator({ pool: stubPool, logger: stubLog });
   assertEq(typeof lastExpressOutput?.content_pieces !== 'undefined' || typeof lastExpressOutput?.final_output !== 'undefined', true,
     'express step output has content_pieces or final_output');
 
+  // ─── 10. PRD-X1 — OpenXMemWalMirror gating ────────────────────────
+  // Unit-style assertion: the factory returns the no-op when the flag is
+  // off OR the env is incomplete; returns a live OpenXMemWalMirror instance
+  // when both flag + env are present. No network required.
+  console.log('10. PRD-X1 — OpenXMemWalMirror flag gating');
+  const { getOpenXMemWalMirror, _resetOpenXMemWalMirror, OpenXMemWalMirror } =
+    await import('../packages/api/src/services/memwalMirror');
+
+  // (a) Flag off → noop singleton; remember() resolves to null without throwing.
+  _resetOpenXMemWalMirror();
+  delete process.env.FEATURE_LOOP_MIRROR_LIVE;
+  const noopMirror = getOpenXMemWalMirror();
+  const noopRes = await noopMirror.remember({ namespace: 'cog-l4-test', text: 'x' });
+  assertEq(noopRes, null, 'flag off → mirror returns null (legacy noop)');
+
+  // (b) Flag on but env incomplete → still noop (defensive).
+  _resetOpenXMemWalMirror();
+  process.env.FEATURE_LOOP_MIRROR_LIVE = 'true';
+  delete process.env.OPENX_OPERATOR_MEMWAL_ACCOUNT_ID;
+  delete process.env.OPENX_OPERATOR_WALLET_ADDRESS;
+  const stillNoop = getOpenXMemWalMirror();
+  assertEq(
+    !(stillNoop instanceof OpenXMemWalMirror),
+    true,
+    'flag on + env missing → falls back to noop',
+  );
+
+  // (c) Flag on + env present → real OpenXMemWalMirror instance returned.
+  _resetOpenXMemWalMirror();
+  process.env.FEATURE_LOOP_MIRROR_LIVE = 'true';
+  process.env.OPENX_OPERATOR_MEMWAL_ACCOUNT_ID = '0xfakeaccount';
+  process.env.OPENX_OPERATOR_WALLET_ADDRESS = '0xfakewallet';
+  process.env.OPENX_MEMWAL_DELEGATE_PRIVATE_KEYS = 'fakeprivkey1';
+  const live = getOpenXMemWalMirror();
+  assertEq(
+    live instanceof OpenXMemWalMirror,
+    true,
+    'flag on + env complete → real OpenXMemWalMirror instance',
+  );
+
+  // Cleanup — leave the suite in a clean env state for downstream runners.
+  _resetOpenXMemWalMirror();
+  delete process.env.FEATURE_LOOP_MIRROR_LIVE;
+  delete process.env.OPENX_OPERATOR_MEMWAL_ACCOUNT_ID;
+  delete process.env.OPENX_OPERATOR_WALLET_ADDRESS;
+  delete process.env.OPENX_MEMWAL_DELEGATE_PRIVATE_KEYS;
+
   // ─── Summary ──────────────────────────────────────────────────────
   console.log('');
   if (failures.length === 0) {

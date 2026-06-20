@@ -45,6 +45,7 @@ import { MemoryService, type MemWalMirror } from '../services/loop/memoryService
 import { ArtifactVaultService } from '../services/loop/artifactVaultService';
 import { BuyerPreferenceProfileService } from '../services/loop/buyerPreferenceProfile';
 import { RightToForgetService } from '../services/loop/rightToForgetService';
+import { getOpenXMemWalMirror } from '../services/memwalMirror';
 import { computeNextRun } from '../services/loop/workflowScheduler';
 import { deriveStatus } from '../services/loop/escrowStatus';
 import {
@@ -359,7 +360,11 @@ router.post('/concierge/search', async (req: Request, res: Response) => {
 /** No-op MemWal mirror — replace with the real OpenXMemWalAdapter when the
  *  v1.1 master flag flips. Keeps the route file decoupled from MemWal so
  *  tests can run without it. */
-const noopMirror: MemWalMirror = { remember: async () => null };
+/** PRD-X1 — `getOpenXMemWalMirror()` returns the live mirror when
+ *  FEATURE_LOOP_MIRROR_LIVE=true, otherwise a no-op (byte-identical to
+ *  legacy). Variable name kept as `noopMirror` to minimize downstream diff
+ *  in this file. See services/memwalMirror.ts. */
+const noopMirror: MemWalMirror = getOpenXMemWalMirror();
 
 let _memory: MemoryService | null = null;
 let _vault: ArtifactVaultService | null = null;
@@ -764,13 +769,16 @@ router.post('/seller/agents/:id/upgrade', async (req: AuthRequest, res: Response
     workflow_walrus_blob_id: string;
     stop_condition_walrus_blob_id?: string;
     area_slugs: string[];
+    /** PRD-X6 — optional on-chain confirmation digest from the buyer-signed
+     *  init_extension PTB. When present, persists workflow_walrus_blob_id
+     *  to the agents row so /listings + /agent/[id] surface kind=workflow
+     *  metadata after the upgrade is verified. */
+    ext_object_id_tx_digest?: string;
   };
   if (!b.workflow_walrus_blob_id || !Array.isArray(b.area_slugs)) {
     return res.status(400).json({ error: 'workflow_walrus_blob_id + area_slugs required' });
   }
-  // Postgres-side: persist declared areas + flag the agent's existing
-  // cognitive_memories rows by re-running the classifier (Postgres-only
-  // for now; on-chain `init_extension` PTB is built via SDK builder).
+  const isLegacyPlaceholder = b.workflow_walrus_blob_id === 'pending-on-chain-ptb';
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -783,6 +791,23 @@ router.post('/seller/agents/:id/upgrade', async (req: AuthRequest, res: Response
         );
       }
     }
+    // PRD-X6 — when the FE has actually pinned + signed init_extension, the
+    // blob_id is real and the kind flips to 'workflow' atomically.
+    if (!isLegacyPlaceholder) {
+      await client.query(
+        `UPDATE agents SET workflow_walrus_blob_id = $1, kind = 'workflow'
+          WHERE id::text = $2 OR slug = $2`,
+        [b.workflow_walrus_blob_id, req.params.id],
+      );
+      logger.info(
+        {
+          agent_id: req.params.id,
+          workflow_walrus_blob_id: b.workflow_walrus_blob_id,
+          ext_object_id_tx_digest: b.ext_object_id_tx_digest ?? null,
+        },
+        'ptb:submit:upgrade',
+      );
+    }
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -793,7 +818,11 @@ router.post('/seller/agents/:id/upgrade', async (req: AuthRequest, res: Response
   res.json({
     ok: true,
     declared_areas: b.area_slugs.length,
-    pending_chain_ptb: { kind: 'init_extension', agent_id: req.params.id, ...b },
+    pending_chain_ptb: isLegacyPlaceholder
+      ? { kind: 'init_extension', agent_id: req.params.id, ...b }
+      : null,
+    upgraded: !isLegacyPlaceholder,
+    ext_object_id_tx_digest: b.ext_object_id_tx_digest ?? null,
   });
 });
 
@@ -1731,6 +1760,144 @@ router.get('/seller/v2-config', async (_req, res) => {
     usdc_coin_type: process.env.OPENX_USDC_COIN_TYPE ?? null,
     publish_fee_micro: 1_000_000,
   });
+});
+
+// ─── PRD-X2 — dry-run endpoint ────────────────────────────────────────
+//
+// POST /v3/loop/agents/dry-run — sandboxed workflow simulation against
+// caller-supplied sample input. Instantiates `WorkflowDispatcher` with the
+// MockStepExecutor (X5 will swap to PhalaStepExecutor via flag), runs the
+// validated workflow, returns the same `WorkflowRunResult` shape as the
+// real run path. NO PTB, NO settlement, NO Walrus writes — purely sandboxed.
+//
+// SOLID: SRP — one verb (dry-run). Reuses the existing dispatcher class.
+router.post('/agents/dry-run', async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const wf = validateWorkflow(body.workflow);
+    const sample = (body.sample_input as Record<string, unknown>) ?? { request: 'dry-run sample' };
+    const budget = typeof body.budget_micro === 'number' && body.budget_micro > 0
+      ? body.budget_micro : 25_000_000;
+
+    const memSvc = new MemoryService({ pool, mirror: noopMirror, logger });
+    const stop = new StopConditionEvaluator({ pool, logger });
+    const out = new OutcomeEvaluator(stop, logger);
+    const exec = new MockStepExecutor(0); // 0ms delay — deterministic.
+    const dispatcher = new WorkflowDispatcher(memSvc, out, exec, logger);
+
+    const t0 = Date.now();
+    const result = await dispatcher.run({
+      workflow: wf,
+      agent_id: 'dry-run-agent',
+      buyer_addr: 'dry-run-buyer',
+      job_id: `dry-${Date.now()}`,
+      buyer_input: sample,
+      area_slug: wf.para?.area_slug,
+      budget_micro: budget,
+    });
+    res.json({ result, elapsed_ms: Date.now() - t0, dry_run: true });
+  } catch (e) {
+    res.status(400).json({ error: 'dry_run_failed', detail: (e as Error).message });
+  }
+});
+
+// ─── PRD-X7-thin — buyer vault (vault page only; /buyer/recalls deferred) ─
+//
+// GET /v3/loop/buyer/vault/runs — buyer-owned deliverables grouped by job_id.
+// GET /v3/loop/buyer/vault/download/:walrus_blob_id — Walrus-aggregator proxy.
+//
+// Auth path: wallet header (handled by the global auth middleware on /v3/loop).
+// Reads from `cognitive_memories` rows under namespace `artifact-vault-{wallet}`
+// + `paid_calls` for cost rollup.
+router.get('/buyer/vault/runs', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address?.toLowerCase();
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const sinceDays = Math.min(Math.max(Number(req.query.sinceDays ?? 30), 1), 90);
+  const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 100);
+  const ns = `artifact-vault-${wallet}`;
+
+  const rows = await pool.query<{
+    job_id: string; area_slug: string | null; artifact_count: number;
+    artifacts: unknown; created_at: string;
+  }>(
+    `SELECT
+       (manifest->>'job_id')      AS job_id,
+       MAX(area_slug)             AS area_slug,
+       COUNT(*)::int              AS artifact_count,
+       json_agg(json_build_object(
+         'artifact_name', manifest->>'artifact_name',
+         'walrus_blob_id', manifest->>'walrus_blob_id',
+         'mime_type', manifest->>'mime_type',
+         'size_bytes', manifest->>'size_bytes'
+       ) ORDER BY created_at DESC) AS artifacts,
+       MAX(created_at)            AS created_at
+     FROM (
+       SELECT created_at, area_slug, text::jsonb AS manifest
+         FROM cognitive_memories
+        WHERE namespace = $1
+          AND created_at > now() - ($2::int * INTERVAL '1 day')
+     ) sub
+    WHERE manifest ? 'job_id' AND manifest ? 'walrus_blob_id'
+    GROUP BY manifest->>'job_id'
+    ORDER BY MAX(created_at) DESC
+    LIMIT $3`,
+    [ns, sinceDays, limit],
+  );
+  res.json({ runs: rows.rows, namespace: ns, sinceDays, limit });
+});
+
+router.get('/buyer/vault/download/:blob_id', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address?.toLowerCase();
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const blobId = String(req.params.blob_id ?? '');
+  if (!blobId) return res.status(400).json({ error: 'blob_id_required' });
+
+  // Authorize: blob must appear in this buyer's vault namespace.
+  const ns = `artifact-vault-${wallet}`;
+  const ownership = await pool.query<{ artifact_name: string | null; mime_type: string | null }>(
+    `SELECT (text::jsonb->>'artifact_name') AS artifact_name,
+            (text::jsonb->>'mime_type')     AS mime_type
+       FROM cognitive_memories
+      WHERE namespace = $1
+        AND text::jsonb->>'walrus_blob_id' = $2
+      LIMIT 1`,
+    [ns, blobId],
+  );
+  if (!ownership.rowCount) return res.status(404).json({ error: 'not_in_vault' });
+
+  // Stream from Walrus aggregator; CORS-safe through the API origin.
+  const aggregator = process.env.WALRUS_AGGREGATOR_URL || '';
+  if (!aggregator) {
+    return res.status(503).json({ error: 'walrus_aggregator_not_configured' });
+  }
+  try {
+    const upstream = await fetch(`${aggregator.replace(/\/$/, '')}/v1/blobs/${blobId}`);
+    if (!upstream.ok || !upstream.body) {
+      return res.status(upstream.status).json({ error: 'walrus_fetch_failed' });
+    }
+    const meta = ownership.rows[0];
+    res.setHeader('Content-Type', meta.mime_type ?? 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${(meta.artifact_name ?? 'artifact').replace(/"/g, '')}"`,
+    );
+    // Stream the body. node-fetch returns a web ReadableStream.
+    const reader = upstream.body.getReader();
+    const pump = async () => {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(Buffer.from(value));
+      }
+      res.end();
+    };
+    await pump();
+  } catch (e) {
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'walrus_proxy_error', detail: (e as Error).message });
+    }
+  }
 });
 
 export default router;

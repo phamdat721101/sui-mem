@@ -1,0 +1,50 @@
+{
+  "id": "S3",
+  "title": "Make-it-pay — Phala-attested run + USDC settlement",
+  "assertions": [
+    {
+      "name": "PhalaStepExecutor returns Phala attestation_hex on success",
+      "verdict": "pass",
+      "evidence": {
+        "attestation_hex": "0xphala-quote-fake-hash",
+        "spent_micro": 1
+      },
+      "ms": 0
+    },
+    {
+      "name": "PhalaStepExecutor falls back to Bedrock with bedrock-fallback: prefix",
+      "verdict": "pass",
+      "evidence": {
+        "attestation_hex_prefix": "bedrock-fallback:b"
+      },
+      "ms": 1
+    },
+    {
+      "name": "Direct settlement worker computes seller/operator split correctly",
+      "verdict": "pass",
+      "evidence": {
+        "settlement_tx_hash": "0xfakedigest",
+        "seller_micro": 950000,
+        "operator_micro": 50000,
+        "operator_bps": 500,
+        "captured": [
+          {
+            "brain_sui_object_id": "0xbrain",
+            "seller": "0xseller",
+            "total_micro": 1000000,
+            "operator_bps": 500
+          }
+        ]
+      },
+      "ms": 1
+    },
+    {
+      "name": "operator_bps volume dial: 500→400→300→200 across thresholds",
+      "verdict": "pass",
+      "evidence": {
+        "tiers": "500/400/300/200"
+      },
+      "ms": 0
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "id": "S2",
+  "title": "Make-it-discoverable — kind=workflow publish path",
+  "assertions": [
+    {
+      "name": "marketplace ?kind= filter is enumerated in route validator",
+      "verdict": "pass",
+      "evidence": {
+        "evidence": "VALID_KINDS + WHERE a.kind = $N"
+      },
+      "ms": 0
+    },
+    {
+      "name": "SellerPublishInput.kind=workflow validator catches missing fields",
+      "verdict": "pass",
+      "evidence": {
+        "kind_path": "validated + persisted"
+      },
+      "ms": 112
+    },
+    {
+      "name": "dry-run dispatcher returns WorkflowRunResult shape with steps + outcome",
+      "verdict": "pass",
+      "evidence": {
+        "steps": 4,
+        "elapsed_ms": 1
+      },
+      "ms": 13
+    }
+  ]
+}

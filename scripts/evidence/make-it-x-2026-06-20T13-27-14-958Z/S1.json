@@ -1,0 +1,48 @@
+{
+  "id": "S1",
+  "title": "Make-it-true — mirror → on-chain init_extension PTB",
+  "assertions": [
+    {
+      "name": "OpenXMemWalMirror gates correctly (flag off → noop)",
+      "verdict": "pass",
+      "evidence": {
+        "kind": "noop_singleton"
+      },
+      "ms": 0
+    },
+    {
+      "name": "OpenXMemWalMirror live (flag on + env complete) instantiates real adapter wrapper",
+      "verdict": "pass",
+      "evidence": {
+        "instance_type": "OpenXMemWalMirror"
+      },
+      "ms": 0
+    },
+    {
+      "name": "buildInitExtensionPtb produces moveCall to openx_loop_workflow_v1_1::init_extension",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_workflow_v1_1::init_extension",
+        "command_count": 1
+      },
+      "ms": 4
+    },
+    {
+      "name": "buildInitExtensionPtb rejects empty + oversize area_slugs",
+      "verdict": "pass",
+      "evidence": {
+        "invariant": "area_slugs in [1..16]"
+      },
+      "ms": 0
+    },
+    {
+      "name": "PRD-X4 — dispatcher emits step_started + step_completed for every step",
+      "verdict": "fail",
+      "evidence": {
+        "error": "Cannot read properties of undefined (reading 'id')",
+        "stack": "TypeError: Cannot read properties of undefined (reading 'id')\n    at MemoryService.softWrite (/Users/phamdat/privacy/sui-memory/packages/api/src/services/loop/memoryService.ts:247:43)\n    at async Promise.all (index 0)\n    at async WorkflowDispatcher.postRunWrites (/Users/phamdat/privacy/sui-memory/packages/api/src/services/loop/workflowDispatcher.ts:448:5)\n    at async WorkflowDispatcher.run (/Users/phamdat/privacy/sui-memory/packages/api/src/services/loop/workflowDispatcher.ts:324:7)\n    at async <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:239:20)\n    at async check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:22)\n    at async <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:218:3)"
+      },
+      "ms": 25
+    }
+  ]
+}

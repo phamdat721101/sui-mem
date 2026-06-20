@@ -61,3 +61,12 @@ export * from './loop/clientCrypto';
 export * from './loop/sellerPublish';
 export * from './loop/x402Settle';
 export * from './loop/loopHire';
+
+// PRD-X6 / X8 PTB builders — the 4 chain-anchored primitives that close
+// the audit's "Honest Open" gaps. Each builder is a pure function that
+// returns a `@mysten/sui` `Transaction`; signing + submit happens in the
+// caller (frontend dapp-kit OR backend operator path).
+export * from './loop/upgradeWorkflow';
+export * from './loop/subscription';
+export * from './loop/rightToForget';
+export * from './loop/personaApprove';

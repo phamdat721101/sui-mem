@@ -146,6 +146,23 @@ export interface StepExecutor {
 
 // ─── Run state ──────────────────────────────────────────────────────
 
+/** PRD-X4 / PRD-X8 — emitted at step boundaries. The SSE route in
+ *  routes/v3-loop.ts (deferred) wraps these into text/event-stream;
+ *  the smoke harness asserts dispatcher emits them in order. */
+export type StepEvent =
+  | { kind: 'step_started'; step_id: string; phase: CodePhase }
+  | { kind: 'step_completed'; step_id: string; phase: CodePhase; spent_micro: number }
+  | { kind: 'step_failed'; step_id: string; phase: CodePhase; reason: string }
+  | {
+      kind: 'step_judged';
+      step_id: string;
+      phase: CodePhase;
+      risk_tier: 'low' | 'medium' | 'high';
+      auto_approve: boolean;
+      confidence: number;
+      reason: string;
+    };
+
 export interface WorkflowRunInput {
   workflow: Workflow;
   agent_id: string;
@@ -157,6 +174,10 @@ export interface WorkflowRunInput {
   stop_condition?: Predicate;
   /** Total budget µUSDC (LoopJob.budget_micro). */
   budget_micro: number;
+  /** PRD-X4 — optional callback fired at step_started / step_completed /
+   *  step_failed / step_judged boundaries. Run-input scope (not constructor)
+   *  so different runs can have different listeners (SSE vs none). */
+  onStepEvent?: (e: StepEvent) => void;
 }
 
 export interface WorkflowRunResult {
@@ -178,6 +199,18 @@ export class WorkflowDispatcher {
     private readonly outcome: OutcomeEvaluator,
     private readonly executor: StepExecutor,
     private readonly logger: Logger,
+    /** PRD-X8 — optional. When present, dispatcher informationally judges
+     *  every step's output against `expected_schema`. The judge enforces
+     *  the invariant `risk_tier=high → never auto_approve`; downstream
+     *  SSE+UI integration uses the verdict to decide pause-for-approval.
+     *  Importing the type as a structural shape avoids a hard dep cycle. */
+    private readonly judge?: {
+      judge(args: {
+        risk_tier: 'low' | 'medium' | 'high';
+        step_output: Record<string, unknown>;
+        expected_schema?: Record<string, string>;
+      }): Promise<{ auto_approve: boolean; confidence: number; reason: string }>;
+    },
   ) {}
 
   async run(input: WorkflowRunInput): Promise<WorkflowRunResult> {
@@ -222,6 +255,9 @@ export class WorkflowDispatcher {
         memory: { recall: { area: warm } },
       });
 
+      // PRD-X4 — emit step_started before the executor is invoked.
+      input.onStepEvent?.({ kind: 'step_started', step_id: step.id, phase });
+
       const status = await this.executeWithPolicy(step, phase, {
         step,
         phase,
@@ -234,6 +270,9 @@ export class WorkflowDispatcher {
 
       if (status.kind === 'failed') {
         per_step.push({ id: step.id, phase, output: {}, spent_micro: 0, status: 'failed' });
+        input.onStepEvent?.({
+          kind: 'step_failed', step_id: step.id, phase, reason: 'executor_exhausted_retries',
+        });
         if (step.on_failure === 'halt') break;
         continue;
       }
@@ -245,6 +284,31 @@ export class WorkflowDispatcher {
         id: step.id, phase, output: status.exec.output,
         spent_micro: status.exec.spent_micro, status: 'ok',
       });
+      input.onStepEvent?.({
+        kind: 'step_completed', step_id: step.id, phase, spent_micro: status.exec.spent_micro,
+      });
+
+      // PRD-X8 — optional judge pass. Informational in v1; SSE+UI integration
+      // uses the verdict to decide pause-for-approval. The judge enforces
+      // the invariant high-risk → never auto_approve internally.
+      if (this.judge) {
+        try {
+          const verdict = await this.judge.judge({
+            risk_tier: step.risk_tier,
+            step_output: status.exec.output,
+            expected_schema: step.output_schema,
+          });
+          input.onStepEvent?.({
+            kind: 'step_judged', step_id: step.id, phase, risk_tier: step.risk_tier,
+            ...verdict,
+          });
+        } catch (e) {
+          this.logger.warn(
+            { step_id: step.id, err: (e as Error).message },
+            'dispatcher:judge_failed_continue',
+          );
+        }
+      }
 
       // L2 write per step — operator-pool fallback OK.
       await this.memory.writeL2({

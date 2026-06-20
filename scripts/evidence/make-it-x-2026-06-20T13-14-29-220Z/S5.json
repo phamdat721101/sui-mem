@@ -1,0 +1,40 @@
+{
+  "id": "S5",
+  "title": "Make-it-safe — RTF + persona-approve + key-rotate",
+  "assertions": [
+    {
+      "name": "buildDeletePerBuyerMemoryPtb requires cooling_off_days ≥ 7",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_workflow_v1_1::delete_per_buyer_memory",
+        "cooling_off_invariant": "days >= 7"
+      },
+      "ms": 2
+    },
+    {
+      "name": "buildPersonaApprovePtb produces update_extension PTB; rejects missing blob id",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_workflow_v1_1::update_extension"
+      },
+      "ms": 1
+    },
+    {
+      "name": "buildRotateDelegatePtb rejects same-pubkey rotation + accepts valid rotate",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_agent_registry::rotate_delegate_key"
+      },
+      "ms": 0
+    },
+    {
+      "name": "subscription create + cancel builders match Move targets + type args",
+      "verdict": "pass",
+      "evidence": {
+        "create_target": "openx_loop_subscription::create_subscription",
+        "cancel_target": "openx_loop_subscription::cancel_subscription"
+      },
+      "ms": 2
+    }
+  ]
+}
