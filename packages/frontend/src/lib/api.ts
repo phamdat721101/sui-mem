@@ -349,10 +349,45 @@ export const api = {
     fetch(`${AGENT_BACKEND_URL}/v3/marketplace/seller/me`, {
       headers: { 'x-wallet-address': wallet },
     }).then((r) => r.json() as Promise<{ seller: SellerProfile | null }>),
-  sellerDashboard: (wallet: string) =>
-    fetch(`${AGENT_BACKEND_URL}/v3/marketplace/seller/dashboard`, {
-      headers: { 'x-wallet-address': wallet },
-    }).then((r) => r.json() as Promise<SellerDashboard>),
+  /**
+   * Returns a fully-shaped `SellerDashboard` for *every* wallet — including
+   * newly-connected wallets that have no `seller` row yet (backend returns
+   * 401/404). Mirrors the defensive contract of `getSellerOnChainStats` /
+   * `getSellerWalletEvents` so consumers can dereference `.agents.length`
+   * and `.earnings.all_time` without optional chaining.
+   *
+   * Crash this previously caused: /settings rendered `dash.agents.length`
+   * inside `{dash && …}`. When the cast lied (`dash = {}`), React threw
+   * during render and unmounted the whole client tree → blank page.
+   */
+  sellerDashboard: async (wallet: string): Promise<SellerDashboard> => {
+    const empty: SellerDashboard = {
+      seller_id: null,
+      agents: [],
+      earnings: { last_7d: '0', last_30d: '0', all_time: '0', calls_7d: 0 },
+    };
+    try {
+      const r = await fetch(`${AGENT_BACKEND_URL}/v3/marketplace/seller/dashboard`, {
+        headers: { 'x-wallet-address': wallet },
+        cache: 'no-store',
+      });
+      if (r.status === 404 || r.status === 401) return empty;
+      if (!r.ok) throw new Error(`sellerDashboard ${r.status}`);
+      const j = (await r.json()) as Partial<SellerDashboard>;
+      return {
+        seller_id: j.seller_id ?? null,
+        agents: Array.isArray(j.agents) ? j.agents : [],
+        earnings: {
+          last_7d: j.earnings?.last_7d ?? '0',
+          last_30d: j.earnings?.last_30d ?? '0',
+          all_time: j.earnings?.all_time ?? '0',
+          calls_7d: j.earnings?.calls_7d ?? 0,
+        },
+      };
+    } catch {
+      return empty;
+    }
+  },
   updateSellerProfile: (wallet: string, patch: Partial<Omit<SellerProfile, 'id' | 'wallet_address'>>) =>
     authedJson<{ ok: true }>('PATCH', '/v3/marketplace/seller/me', wallet, patch),
   publish: (wallet: string, input: PublishInput) =>
