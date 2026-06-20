@@ -36,6 +36,53 @@ export function walrusViewUrl(blob_id: string | null | undefined): string | null
   return `${WALRUS_AGGREGATOR}/v1/blobs/${blob_id}`;
 }
 
+/**
+ * Trigger a browser file download for an in-memory `Blob`. SSR-safe: no-op
+ * on the server. Single source of truth so vault + run-result downloads
+ * never reimplement the `<a download>` dance.
+ */
+export function triggerDownload(blob: Blob, filename: string): void {
+  if (typeof window === 'undefined') return;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Defer revoke so Chrome/Firefox have time to start the download.
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+/**
+ * Authed download of a buyer-vault blob via the API proxy
+ * (`/v3/loop/buyer/vault/blob/:blob_id`). Bypasses every browser-direct
+ * Walrus failure mode (aggregator CORS / rate-limit / placeholder ids /
+ * inline-render surprises) by streaming server-side bytes through the API.
+ *
+ * Throws on any non-OK response so the caller can surface the error.
+ */
+export async function vaultDownload(
+  wallet: string,
+  blob_id: string,
+  fallbackName?: string,
+): Promise<void> {
+  const r = await fetch(
+    `${AGENT_BACKEND_URL}/v3/loop/buyer/vault/blob/${encodeURIComponent(blob_id)}`,
+    { headers: { 'x-wallet-address': wallet } },
+  );
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({} as { error?: string }));
+    throw new Error(j.error ?? `download ${r.status}`);
+  }
+  // Prefer server-supplied filename; fall back to the caller hint.
+  const cd = r.headers.get('content-disposition') ?? '';
+  const m = /filename="([^"]+)"/.exec(cd);
+  const name = m?.[1] || fallbackName || `${blob_id}.bin`;
+  triggerDownload(await r.blob(), name);
+}
+
 /** Build a Suiscan tx URL, or null when the tx_hash is synthetic (cron forks,
  *  Run-Now demos) or the network isn't a real Sui network. */
 export function explorerTxUrl(network: string | null | undefined, tx_hash: string | null | undefined): string | null {

@@ -5,7 +5,7 @@ import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { useCurrentAccount, useSignAndExecuteTransaction, useSuiClient } from '@mysten/dapp-kit';
 import { Transaction } from '@mysten/sui/transactions';
-import { AGENT_BACKEND_URL, api, priceFromPricing, type Listing, type MemWalBrain } from '@/lib/api';
+import { AGENT_BACKEND_URL, api, priceFromPricing, triggerDownload, type Listing, type MemWalBrain, type WorkflowYaml } from '@/lib/api';
 import { AgentRecentCalls } from '@/components/AgentRecentCalls';
 
 /**
@@ -447,6 +447,19 @@ function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose:
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
 
+  // Load the seller's workflow so the buyer hires *seeing* what runs, not
+  // a blank form. Endpoint is `wallet_required` only — buyer's wallet is
+  // sufficient. Silent failure is intentional: a missing workflow shouldn't
+  // block hiring (recurring jobs can still escrow against the seller).
+  const [workflow, setWorkflow] = useState<WorkflowYaml | null>(null);
+  const [workflowError, setWorkflowError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!account?.address) return;
+    api.getWorkflow(account.address, agentSlug)
+      .then((r) => setWorkflow(r.workflow))
+      .catch((e: Error) => setWorkflowError(e.message));
+  }, [account?.address, agentSlug]);
+
   const submit = async () => {
     if (!account?.address) {
       setError('connect wallet');
@@ -510,6 +523,8 @@ function HireWorkflowModal({ agentSlug, onClose }: { agentSlug: string; onClose:
             ✕
           </button>
         </div>
+
+        <WorkflowPreview workflow={workflow} error={workflowError} />
 
         <div className="flex gap-2">
           <ToggleChip on={!f.recurring} onClick={() => setF({ ...f, recurring: false })} label="One-shot" />
@@ -607,6 +622,85 @@ function ToggleChip({ on, onClick, label }: { on: boolean; onClick: () => void; 
     </button>
   );
 }
+
+/**
+ * Read-only summary of the seller's saved workflow so the buyer hires with
+ * eyes open. Renders step ids, capabilities and PARA phases — the same
+ * shape the runtime executes, projected to a non-secret view (no inputs,
+ * no per-step prompts, no risk tier).
+ *
+ * SOLID:
+ *  - SRP: presentation only; the data fetch lives in HireWorkflowModal.
+ *  - OCP: a new step type renders for free — `step.capability` + phase
+ *    badge are generic.
+ *  - Loading/empty/error are 3 cheap branches; no spinner library needed.
+ */
+function WorkflowPreview({
+  workflow,
+  error,
+}: {
+  workflow: WorkflowYaml | null;
+  error: string | null;
+}) {
+  if (error) {
+    return (
+      <div className="rounded-md border border-outline-variant/30 bg-surface-container-low p-2.5 text-[11px] text-on-surface-variant">
+        Couldn&apos;t load workflow preview ({error}). You can still subscribe.
+      </div>
+    );
+  }
+  if (!workflow) {
+    return (
+      <div className="rounded-md border border-outline-variant/20 bg-surface-container-low p-2.5 text-[11px] text-on-surface-variant">
+        Loading workflow preview…
+      </div>
+    );
+  }
+  const steps = workflow.steps ?? [];
+  if (!steps.length) {
+    return (
+      <div className="rounded-md border border-outline-variant/20 bg-surface-container-low p-2.5 text-[11px] text-on-surface-variant">
+        Seller hasn&apos;t published a workflow yet.
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-md border border-primary/20 bg-primary/5 p-2.5">
+      <div className="flex items-center justify-between text-[10px] font-mono uppercase">
+        <span className="text-primary">Workflow · {workflow.name}</span>
+        <span className="text-on-surface-variant">{steps.length} step{steps.length === 1 ? '' : 's'}</span>
+      </div>
+      <ol className="mt-1.5 space-y-1 text-[11px]">
+        {steps.slice(0, 6).map((s, i) => (
+          <li key={s.id} className="flex items-center gap-2">
+            <span className="font-mono text-on-surface-variant">{String(i + 1).padStart(2, '0')}.</span>
+            {s.phase && (
+              <span className={`rounded px-1.5 py-0.5 font-mono text-[9px] uppercase ${PHASE_BADGE[s.phase] ?? 'bg-on-surface/10 text-on-surface-variant'}`}>
+                {s.phase}
+              </span>
+            )}
+            <span className="font-mono text-on-surface">{s.id}</span>
+            <span className="ml-auto truncate font-mono text-[10px] text-on-surface-variant" title={s.capability}>
+              {s.capability}
+            </span>
+          </li>
+        ))}
+        {steps.length > 6 && (
+          <li className="pl-7 font-mono text-[10px] text-on-surface-variant">
+            … +{steps.length - 6} more
+          </li>
+        )}
+      </ol>
+    </div>
+  );
+}
+
+const PHASE_BADGE: Record<NonNullable<WorkflowYaml['steps'][number]['phase']>, string> = {
+  capture:  'bg-blue-500/15 text-blue-300',
+  organize: 'bg-amber-500/15 text-amber-300',
+  distill:  'bg-purple-500/15 text-purple-300',
+  express:  'bg-emerald-500/15 text-emerald-300',
+};
 
 function formatHm(m: number): string {
   return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
@@ -853,7 +947,25 @@ function RunWorkflowNowModal({ agentSlug, onClose }: { agentSlug: string; onClos
 
             {result.final_output && (
               <div className="space-y-1">
-                <h3 className="font-mono text-[10px] uppercase text-on-surface-variant">Result</h3>
+                <div className="flex items-center justify-between">
+                  <h3 className="font-mono text-[10px] uppercase text-on-surface-variant">Result</h3>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // Same trigger pattern reused by the vault download —
+                      // single helper, no per-page reimplementation.
+                      const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+                      triggerDownload(
+                        new Blob([result.final_output], { type: 'text/markdown' }),
+                        `${agentSlug}-${ts}.md`,
+                      );
+                    }}
+                    className="rounded-full border border-primary/40 bg-primary/5 px-2.5 py-0.5 font-mono text-[10px] uppercase text-primary hover:bg-primary/10"
+                    title="Download as Markdown"
+                  >
+                    ↓ .md
+                  </button>
+                </div>
                 <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-lg bg-surface-container-low p-3 text-[12px] font-mono">
                   {result.final_output}
                 </pre>

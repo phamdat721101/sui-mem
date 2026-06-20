@@ -613,6 +613,46 @@ router.get('/buyer/vault', async (req: AuthRequest, res: Response) => {
   res.json({ entries });
 });
 
+/**
+ * GET /v3/loop/buyer/vault/blob/:blob_id
+ *
+ * Server-side proxy that streams a single artifact-vault blob to the buyer
+ * with `Content-Disposition: attachment`. Solves the prod-only download
+ * failure where the FE built direct Walrus aggregator URLs:
+ *   • aggregator CORS / rate-limit edge cases on Vercel,
+ *   • placeholder blob ids never pinned to Walrus,
+ *   • mixed-content / inline-rendering surprises.
+ *
+ * Authz: the blob must belong to `artifact-vault-{x-wallet-address}`. No
+ * feature flag — works for legacy vault entries (PRD-W v1.1) too.
+ *
+ * Reuses the same Walrus client + lazy-import pattern as `runs/:job_id/bundle.zip`.
+ */
+router.get('/buyer/vault/blob/:blob_id', async (req: AuthRequest, res: Response) => {
+  const wallet = req.user?.address;
+  if (!wallet) return res.status(401).json({ error: 'wallet_required' });
+  const blob_id = String(req.params.blob_id ?? '');
+  if (!blob_id) return res.status(400).json({ error: 'blob_id_required' });
+
+  const entry = await vault().findEntry(wallet, blob_id);
+  if (!entry) return res.status(404).json({ error: 'not_in_vault' });
+
+  try {
+    const { createWalrusStore } = await import('@fhe-ai-context/sui-sdk');
+    const bytes = await createWalrusStore().fetch(blob_id);
+    // Strip quotes/CR/LF from artifact_name so the Content-Disposition header
+    // can never be smuggled. Worst case the buyer downloads `download.bin`.
+    const safe = (entry.artifact_name || 'download.bin').replace(/[\r\n"]/g, '');
+    res.setHeader('Content-Type', entry.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}"`);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.end(Buffer.from(bytes));
+  } catch (e) {
+    logger.error({ err: (e as Error).message, blob_id }, 'vault:download_failed');
+    res.status(502).json({ error: 'walrus_fetch_failed' });
+  }
+});
+
 // ─── PRD-W v1.2 — per-run timeline + bundle ZIP + digest ─────────────────
 //
 // The vault endpoint above stays for legacy clients. The 3 endpoints below

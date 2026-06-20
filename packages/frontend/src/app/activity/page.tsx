@@ -22,7 +22,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useCurrentAccount } from '@mysten/dapp-kit';
-import { api, walrusViewUrl, isPlaceholderBlob, type RunGroup, type RunStatus } from '@/lib/api';
+import { api, walrusViewUrl, isPlaceholderBlob, vaultDownload, type RunGroup, type RunStatus } from '@/lib/api';
 
 const FEATURE_TIMELINE = process.env.NEXT_PUBLIC_FEATURE_LOOP_RUN_TIMELINE === 'true';
 
@@ -551,7 +551,7 @@ function LegacyVaultPanel({ wallet }: { wallet: string }) {
               <ul className="space-y-1 px-3 pb-3 text-xs">
                 {items.map((e, i) => (
                   <li key={`${e.walrus_blob_id}-${i}`} className="flex items-center justify-between gap-2">
-                    <span className="font-mono">{e.artifact_name}</span>
+                    <VaultArtifactName wallet={wallet} entry={e} />
                     <span className="text-[10px] text-on-surface-variant">
                       {new Date(e.created_at).toLocaleDateString()}
                     </span>
@@ -563,6 +563,51 @@ function LegacyVaultPanel({ wallet }: { wallet: string }) {
         </div>
       )}
     </Section>
+  );
+}
+
+/**
+ * Artifact name rendered as a download button. Uses the API proxy
+ * (`vaultDownload`) which works in every browser context (Vercel + dev),
+ * not direct Walrus aggregator URLs which are fragile in production.
+ *
+ * Placeholder blobs (`pending-…`, `stub-…`) render as disabled labels —
+ * the seller hasn't pinned the artifact yet, so there's nothing to fetch.
+ */
+function VaultArtifactName({ wallet, entry }: {
+  wallet: string;
+  entry: { artifact_name: string; walrus_blob_id: string };
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const placeholder = isPlaceholderBlob(entry.walrus_blob_id);
+
+  if (placeholder) {
+    return (
+      <span
+        className="font-mono text-on-surface-variant"
+        title="Artifact not pinned to Walrus yet"
+      >
+        {entry.artifact_name} <span className="text-[10px]">· pending</span>
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      onClick={async () => {
+        setErr(null);
+        setBusy(true);
+        try { await vaultDownload(wallet, entry.walrus_blob_id, entry.artifact_name); }
+        catch (e) { setErr((e as Error).message); }
+        finally { setBusy(false); }
+      }}
+      className="font-mono text-on-surface hover:text-primary disabled:opacity-50"
+      title={err ? `Failed: ${err}` : `Download ${entry.artifact_name}`}
+    >
+      {entry.artifact_name} {busy ? '↓…' : '↓'}
+    </button>
   );
 }
 

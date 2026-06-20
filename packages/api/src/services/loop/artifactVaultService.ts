@@ -138,6 +138,24 @@ export class ArtifactVaultService {
   }
 
   /**
+   * Resolve a single vault entry by `walrus_blob_id` for *this buyer only*.
+   *
+   * Used by the buyer-vault download proxy route — the route fetches the
+   * blob server-side (bypassing aggregator CORS / rate-limits / placeholder
+   * issues that surface in browser-direct downloads) and streams it back
+   * with `Content-Disposition: attachment`. Authz invariant: the entry's
+   * namespace MUST equal `artifact-vault-{buyer_addr}` — enforced here by
+   * scoping the query to that namespace.
+   *
+   * Returns `null` when the blob isn't in the buyer's vault (404 territory).
+   */
+  async findEntry(buyer_addr: string, walrus_blob_id: string): Promise<VaultEntry | null> {
+    if (!walrus_blob_id) return null;
+    const all = await this.list(buyer_addr);
+    return all.find((e) => e.walrus_blob_id === walrus_blob_id) ?? null;
+  }
+
+  /**
    * Group artifacts by run (`job_id`) sorted by run start DESC. Reads from
    * the `workflow_run_artifacts` view (migration 035) which left-joins the
    * vault manifests with `workflow_runs` for status + cost + step_count.
