@@ -657,10 +657,17 @@ router.get('/buyer/vault/blob/:blob_id', async (req: AuthRequest, res: Response)
 //
 // The vault endpoint above stays for legacy clients. The 3 endpoints below
 // power the new `/activity` Run Timeline panel + Run Detail Drawer + Weekly
-// Digest card. Master flag: `FEATURE_LOOP_RUN_TIMELINE`.
+// Digest card.
+//
+// Gate semantics (post-GA):
+//   FEATURE_LOOP_RUN_TIMELINE  / FEATURE_LOOP_RUN_BUNDLE_ZIP
+//     unset or anything ≠ 'false' → ENABLED (default).
+//     'false'                     → DISABLED (emergency rollback only).
+//   FEATURE_WEEKLY_DIGEST stays explicit-on; cron + content backfill not yet
+//   universally available, and the FE WeeklyDigestCard self-hides on null.
 
-const runTimelineEnabled = () => process.env.FEATURE_LOOP_RUN_TIMELINE === 'true';
-const runBundleZipEnabled = () => process.env.FEATURE_LOOP_RUN_BUNDLE_ZIP === 'true';
+const runTimelineEnabled = () => process.env.FEATURE_LOOP_RUN_TIMELINE !== 'false';
+const runBundleZipEnabled = () => process.env.FEATURE_LOOP_RUN_BUNDLE_ZIP !== 'false';
 const weeklyDigestEnabled = () => process.env.FEATURE_WEEKLY_DIGEST === 'true';
 
 /**

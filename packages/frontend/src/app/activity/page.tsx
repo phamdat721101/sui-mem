@@ -15,8 +15,11 @@
  *   - OCP: a fifth panel = one new section, no other change.
  *
  * Feature flag (NEXT_PUBLIC_FEATURE_LOOP_RUN_TIMELINE):
- *   - 'true'  → renders the new RunTimelinePanel + WeeklyDigestCard.
- *   - else    → renders LegacyVaultPanel (byte-identical to v1.1).
+ *   - unset / anything ≠ 'false' → RunTimelinePanel + WeeklyDigestCard (default).
+ *   - 'false'                    → LegacyVaultPanel (emergency rollback only).
+ *
+ * Default-on rationale: PRD-W v1.2 timeline UI has shipped. Vercel deploys
+ * shouldn't need extra env config to get the canonical product surface.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -24,7 +27,7 @@ import Link from 'next/link';
 import { useCurrentAccount } from '@mysten/dapp-kit';
 import { api, walrusViewUrl, isPlaceholderBlob, vaultDownload, type RunGroup, type RunStatus } from '@/lib/api';
 
-const FEATURE_TIMELINE = process.env.NEXT_PUBLIC_FEATURE_LOOP_RUN_TIMELINE === 'true';
+const FEATURE_TIMELINE = process.env.NEXT_PUBLIC_FEATURE_LOOP_RUN_TIMELINE !== 'false';
 
 interface Subscription {
   subscription_object_id: string;
