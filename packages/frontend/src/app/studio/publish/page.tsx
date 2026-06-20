@@ -47,10 +47,6 @@ interface FormState {
   pricing_amount_usdc: string;
   tier: BedrockTier;
   model_id: string;
-  /** PRD-X2 — agent kind. 'workflow' adds 1 extra field (area_slugs);
-   *  workflow_walrus_blob_id is auto-pinned at submit. */
-  kind: 'api' | 'workflow';
-  area_slugs: string;
 }
 
 const INITIAL: FormState = {
@@ -63,8 +59,6 @@ const INITIAL: FormState = {
   pricing_amount_usdc: '0.01',
   tier: 'balanced',
   model_id: defaultModelIdForTier('balanced'),
-  kind: 'api',
-  area_slugs: '',
 };
 
 export default function PublishPage() {
@@ -122,24 +116,6 @@ function PublishForm({ wallet }: { wallet: string }) {
 
   async function submitLegacy() {
     setStatus('Saving to catalog…');
-    const areas = form.kind === 'workflow'
-      ? form.area_slugs.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 16)
-      : undefined;
-    // PRD-X2 — for kind=workflow we need a Walrus blob id. Pin a minimal
-    // workflow skeleton manifest at publish time; the seller's full YAML
-    // edit happens later via /agent/[id]/workflow.
-    let workflowBlobId: string | undefined;
-    if (form.kind === 'workflow') {
-      setStatus('Pinning workflow skeleton to Walrus…');
-      const skeleton = buildWorkflowSkeleton(form);
-      workflowBlobId = await publishToWalrus(skeleton).catch(() => undefined);
-      if (!workflowBlobId) {
-        // Walrus unavailable in some envs; fall back to a deterministic
-        // placeholder so the legacy publish path still records kind=workflow
-        // (operator/back-fill cron can re-pin later).
-        workflowBlobId = 'workflow-skeleton-pending';
-      }
-    }
     const r = await api.publish(wallet, {
       title: form.title.trim(),
       short_description: form.short_description.trim(),
@@ -148,9 +124,6 @@ function PublishForm({ wallet }: { wallet: string }) {
       tags: form.tags.split(',').map((t) => t.trim()).filter(Boolean),
       persona_system_prompt: form.persona_system_prompt.trim(),
       pricing_amount_usdc: form.pricing_amount_usdc,
-      kind: form.kind,
-      workflow_walrus_blob_id: workflowBlobId,
-      area_slugs: areas,
     });
     setResult(r);
   }
@@ -196,16 +169,6 @@ function PublishForm({ wallet }: { wallet: string }) {
 
     // 6. Mirror to Postgres via existing /v3/marketplace/seller/publish.
     setStatus('Saving to catalog…');
-    // Workflow path: pin a skeleton blob too. The Bedrock-validated v2
-    // PTB uses `manifestWalrusBlobId` for the agent record; the workflow
-    // blob is a separate pin consumed by the upgrade init_extension PTB.
-    let workflowBlobId: string | undefined;
-    let areas: string[] | undefined;
-    if (form.kind === 'workflow') {
-      const skel = buildWorkflowSkeleton(form);
-      workflowBlobId = await publishToWalrus(skel).catch(() => 'workflow-skeleton-pending');
-      areas = form.area_slugs.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 16);
-    }
     const r = await api.publish(wallet, {
       title: form.title.trim(),
       short_description: form.short_description.trim(),
@@ -214,9 +177,6 @@ function PublishForm({ wallet }: { wallet: string }) {
       tags: form.tags.split(',').map((t) => t.trim()).filter(Boolean),
       persona_system_prompt: form.persona_system_prompt.trim(),
       pricing_amount_usdc: form.pricing_amount_usdc,
-      kind: form.kind,
-      workflow_walrus_blob_id: workflowBlobId,
-      area_slugs: areas,
       // Server validates via BEDROCK_MODEL_CATALOG and stores fee_tx_digest.
       default_model_id: form.model_id,
       fee_tx_digest: signed.digest,
@@ -246,28 +206,6 @@ function PublishForm({ wallet }: { wallet: string }) {
       </header>
 
       <form onSubmit={(e) => { e.preventDefault(); submit(); }} className="space-y-5 rounded-xl border border-outline-variant/30 bg-surface p-6">
-        {/* PRD-X2 / T5 — kind selector. 'api' (default) preserves the legacy
-            single-form publish; 'workflow' surfaces the area_slugs field +
-            pins a workflow skeleton at submit. 'skill' deferred per PRD-15. */}
-        <div className="space-y-2">
-          <span className="font-mono text-[10px] uppercase text-on-surface-variant">Agent kind</span>
-          <div className="flex flex-wrap gap-2">
-            {(['api', 'workflow'] as const).map((k) => (
-              <button
-                key={k}
-                type="button"
-                onClick={() => set('kind', k)}
-                className={`rounded-full border px-4 py-1.5 font-mono text-xs ${form.kind === k ? 'border-primary bg-primary/15 text-primary' : 'border-outline-variant/40 text-on-surface-variant hover:bg-surface-container'}`}
-              >
-                {k === 'api' ? 'API · paid per call' : 'Workflow · paid per outcome'}
-              </button>
-            ))}
-            <button type="button" disabled className="rounded-full border border-outline-variant/30 px-4 py-1.5 font-mono text-xs text-on-surface-variant/50">
-              Skill (soon)
-            </button>
-          </div>
-        </div>
-
         <Field label="Title" hint="3–120 chars">
           <input value={form.title} onChange={(e) => set('title', e.target.value)} required minLength={3} maxLength={120} className={inputCx} placeholder="Wiz Trading" />
         </Field>
@@ -295,22 +233,6 @@ function PublishForm({ wallet }: { wallet: string }) {
         <Field label="Tags" hint="comma-separated · up to 10">
           <input value={form.tags} onChange={(e) => set('tags', e.target.value)} className={inputCx} placeholder="trading, quant, signals" />
         </Field>
-
-        {form.kind === 'workflow' && (
-          <Field
-            label="PARA areas"
-            hint="comma-separated · 1–16 · ongoing concerns this agent specialises in"
-          >
-            <input
-              value={form.area_slugs}
-              onChange={(e) => set('area_slugs', e.target.value)}
-              className={inputCx}
-              placeholder="vietnam-ev, twitter-thread-tone, weekly-research-brief"
-              required
-              minLength={1}
-            />
-          </Field>
-        )}
 
         {v2Ready && (
           <div className="space-y-2">
@@ -440,36 +362,6 @@ async function publishToWalrus(yaml: string): Promise<string> {
   const blobId = j.newlyCreated?.blobObject?.blobId ?? j.alreadyCertified?.blobId;
   if (!blobId) throw new Error('walrus PUT: missing blobId');
   return blobId;
-}
-
-/** PRD-X2 — minimal v1.1 workflow skeleton pinned at publish time so kind=workflow
- *  agents can be created without forcing the seller to author the full DAG up front.
- *  The seller refines via /agent/[id]/workflow after publish. */
-function buildWorkflowSkeleton(form: FormState): string {
-  const safeTitle = form.title.replace(/"/g, "'") || 'workflow';
-  return JSON.stringify(
-    {
-      version: 'v1.1',
-      name: `${safeTitle} (skeleton)`,
-      para: { default_kind: 'project' },
-      steps: [
-        {
-          id: 'capture-1', capability: 'web_search',
-          depends_on: [], inputs: { query: '{{ buyer_input.request }}' },
-          output_schema: { findings: 'string[]' },
-          on_failure: 'halt', max_micro_usdc: 100_000, risk_tier: 'low',
-        },
-        {
-          id: 'express-1', capability: 'summarize',
-          depends_on: ['capture-1'], inputs: { findings: '{{ steps.capture-1.findings }}' },
-          output_schema: { final_output: 'string' },
-          on_failure: 'halt', max_micro_usdc: 200_000, risk_tier: 'medium',
-        },
-      ],
-    },
-    null,
-    2,
-  );
 }
 
 const inputCx = 'w-full rounded-lg border border-outline-variant/40 bg-surface-container-low px-3 py-2 text-sm text-on-surface focus:border-primary/60 focus:outline-none';

@@ -122,6 +122,39 @@ export function validateWorkflow(raw: unknown): Workflow {
   };
 }
 
+// ─── Default skeleton (PRD-X — buyer-side self-heal) ─────────────────
+//
+// When a kind=workflow agent's seller hasn't yet authored a custom YAML
+// (very common: seller upgrades, immediately a buyer wants to hire), the
+// /run-workflow endpoint falls back to this 2-step skeleton so the buyer
+// gets a real result instead of `no_workflow_saved`. Seller can refine
+// later via /agent/[id]/workflow editor — latest-wins on cognitive_memories.
+//
+// SOLID: SRP — one pure factory. Same shape as the publish + upgrade page
+// skeletons in the FE; single source of truth lives here so renames stay
+// consistent (FE and BE both ship the same shape).
+export function defaultWorkflowSkeleton(agent_id: string): Workflow {
+  return validateWorkflow({
+    version: 'v1.1',
+    name: `agent-${agent_id} (default)`,
+    para: { default_kind: 'project' },
+    steps: [
+      {
+        id: 'capture-1', capability: 'web_search', depends_on: [],
+        inputs: { query: '{{ buyer_input.request }}' },
+        output_schema: { findings: 'string[]' },
+        on_failure: 'halt', max_micro_usdc: 100_000, risk_tier: 'low',
+      },
+      {
+        id: 'express-1', capability: 'summarize', depends_on: ['capture-1'],
+        inputs: { findings: '{{ steps.capture-1.findings }}' },
+        output_schema: { final_output: 'string' },
+        on_failure: 'halt', max_micro_usdc: 200_000, risk_tier: 'medium',
+      },
+    ],
+  });
+}
+
 // ─── Step executor (DIP boundary) ──────────────────────────────────
 
 export interface StepExecutionInput {

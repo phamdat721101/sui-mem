@@ -1,0 +1,55 @@
+{
+  "id": "S2",
+  "title": "Make-it-discoverable — kind=workflow publish path",
+  "assertions": [
+    {
+      "name": "marketplace ?kind= filter is enumerated in route validator",
+      "verdict": "pass",
+      "evidence": {
+        "evidence": "VALID_KINDS + WHERE a.kind = $N"
+      },
+      "ms": 0
+    },
+    {
+      "name": "SellerPublishInput.kind=workflow validator catches missing fields",
+      "verdict": "pass",
+      "evidence": {
+        "kind_path": "validated + persisted"
+      },
+      "ms": 37
+    },
+    {
+      "name": "dry-run dispatcher returns WorkflowRunResult shape with steps + outcome",
+      "verdict": "pass",
+      "evidence": {
+        "steps": 4,
+        "elapsed_ms": 1
+      },
+      "ms": 2
+    },
+    {
+      "name": "PRD-X6 — /upgrade flips agents.kind=workflow when blob_id is real (not placeholder)",
+      "verdict": "pass",
+      "evidence": {
+        "invariant": "kind=workflow only on real blob_id"
+      },
+      "ms": 0
+    },
+    {
+      "name": "Regression — upgrade page must NOT hardcode the legacy placeholder",
+      "verdict": "pass",
+      "evidence": {
+        "invariant": "kind=workflow path is always reachable from upgrade UI"
+      },
+      "ms": 0
+    },
+    {
+      "name": "Discoverability — api-only listings surface the Upgrade-to-workflow link",
+      "verdict": "pass",
+      "evidence": {
+        "invariant": "sellers + buyers can find the upgrade path on api-only agents"
+      },
+      "ms": 0
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "id": "S1",
+  "title": "Make-it-true — mirror → on-chain init_extension PTB",
+  "assertions": [
+    {
+      "name": "OpenXMemWalMirror gates correctly (flag off → noop)",
+      "verdict": "pass",
+      "evidence": {
+        "kind": "noop_singleton"
+      },
+      "ms": 1
+    },
+    {
+      "name": "OpenXMemWalMirror live (flag on + env complete) instantiates real adapter wrapper",
+      "verdict": "pass",
+      "evidence": {
+        "instance_type": "OpenXMemWalMirror"
+      },
+      "ms": 0
+    },
+    {
+      "name": "buildInitExtensionPtb produces moveCall to openx_loop_workflow_v1_1::init_extension",
+      "verdict": "pass",
+      "evidence": {
+        "target": "openx_loop_workflow_v1_1::init_extension",
+        "command_count": 1
+      },
+      "ms": 4
+    },
+    {
+      "name": "buildInitExtensionPtb rejects empty + oversize area_slugs",
+      "verdict": "pass",
+      "evidence": {
+        "invariant": "area_slugs in [1..16]"
+      },
+      "ms": 1
+    },
+    {
+      "name": "PRD-X4 — dispatcher emits step_started + step_completed for every step",
+      "verdict": "pass",
+      "evidence": {
+        "events_emitted": 8,
+        "steps": 4
+      },
+      "ms": 23
+    }
+  ]
+}

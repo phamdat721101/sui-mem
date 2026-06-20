@@ -56,6 +56,7 @@ import { MockStepExecutor } from '../services/loop/mockStepExecutor';
 import {
   WorkflowDispatcher,
   validateWorkflow,
+  defaultWorkflowSkeleton,
 } from '../services/loop/workflowDispatcher';
 import { OutcomeEvaluator } from '../services/loop/outcomeEvaluator';
 import { StopConditionEvaluator } from '../services/loop/stopConditionEvaluator';
@@ -769,16 +770,12 @@ router.post('/seller/agents/:id/upgrade', async (req: AuthRequest, res: Response
     workflow_walrus_blob_id: string;
     stop_condition_walrus_blob_id?: string;
     area_slugs: string[];
-    /** PRD-X6 — optional on-chain confirmation digest from the buyer-signed
-     *  init_extension PTB. When present, persists workflow_walrus_blob_id
-     *  to the agents row so /listings + /agent/[id] surface kind=workflow
-     *  metadata after the upgrade is verified. */
-    ext_object_id_tx_digest?: string;
   };
   if (!b.workflow_walrus_blob_id || !Array.isArray(b.area_slugs)) {
     return res.status(400).json({ error: 'workflow_walrus_blob_id + area_slugs required' });
   }
-  const isLegacyPlaceholder = b.workflow_walrus_blob_id === 'pending-on-chain-ptb';
+  // Postgres-side: persist declared areas. On-chain `init_extension` PTB
+  // is built via the SDK builder when the master flag flips.
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -791,23 +788,6 @@ router.post('/seller/agents/:id/upgrade', async (req: AuthRequest, res: Response
         );
       }
     }
-    // PRD-X6 — when the FE has actually pinned + signed init_extension, the
-    // blob_id is real and the kind flips to 'workflow' atomically.
-    if (!isLegacyPlaceholder) {
-      await client.query(
-        `UPDATE agents SET workflow_walrus_blob_id = $1, kind = 'workflow'
-          WHERE id::text = $2 OR slug = $2`,
-        [b.workflow_walrus_blob_id, req.params.id],
-      );
-      logger.info(
-        {
-          agent_id: req.params.id,
-          workflow_walrus_blob_id: b.workflow_walrus_blob_id,
-          ext_object_id_tx_digest: b.ext_object_id_tx_digest ?? null,
-        },
-        'ptb:submit:upgrade',
-      );
-    }
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -818,11 +798,7 @@ router.post('/seller/agents/:id/upgrade', async (req: AuthRequest, res: Response
   res.json({
     ok: true,
     declared_areas: b.area_slugs.length,
-    pending_chain_ptb: isLegacyPlaceholder
-      ? { kind: 'init_extension', agent_id: req.params.id, ...b }
-      : null,
-    upgraded: !isLegacyPlaceholder,
-    ext_object_id_tx_digest: b.ext_object_id_tx_digest ?? null,
+    pending_chain_ptb: { kind: 'init_extension', agent_id: req.params.id, ...b },
   });
 });
 

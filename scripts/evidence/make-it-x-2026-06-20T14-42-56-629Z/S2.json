@@ -1,0 +1,68 @@
+{
+  "id": "S2",
+  "title": "Make-it-discoverable — kind=workflow publish path",
+  "assertions": [
+    {
+      "name": "marketplace ?kind= filter uses derived kind (covers stuck pre-fix upgrades)",
+      "verdict": "fail",
+      "evidence": {
+        "error": "VALID_KINDS set declared",
+        "stack": "Error: VALID_KINDS set declared\n    at assertTrue (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:99:20)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:272:7)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:267:11)"
+      },
+      "ms": 1
+    },
+    {
+      "name": "SellerPublishInput.kind=workflow validator catches missing fields",
+      "verdict": "pass",
+      "evidence": {
+        "kind_path": "validated + persisted"
+      },
+      "ms": 96
+    },
+    {
+      "name": "dry-run dispatcher returns WorkflowRunResult shape with steps + outcome",
+      "verdict": "pass",
+      "evidence": {
+        "steps": 4,
+        "elapsed_ms": 0
+      },
+      "ms": 1
+    },
+    {
+      "name": "PRD-X6 — /upgrade always flips agents.kind=workflow when areas are declared",
+      "verdict": "fail",
+      "evidence": {
+        "error": "kind flips to workflow on every successful upgrade",
+        "stack": "Error: kind flips to workflow on every successful upgrade\n    at assertTrue (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:99:20)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:347:7)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:338:11)"
+      },
+      "ms": 1
+    },
+    {
+      "name": "Regression — upgrade page must NOT hardcode the legacy placeholder",
+      "verdict": "fail",
+      "evidence": {
+        "error": "upgrade page no longer posts the legacy placeholder string",
+        "stack": "Error: upgrade page no longer posts the legacy placeholder string\n    at assertTrue (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:99:20)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:367:7)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:362:11)"
+      },
+      "ms": 0
+    },
+    {
+      "name": "Discoverability — api-only listings surface the Upgrade-to-workflow link",
+      "verdict": "fail",
+      "evidence": {
+        "error": "api-only conditional present",
+        "stack": "Error: api-only conditional present\n    at assertTrue (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:99:20)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:387:7)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:382:11)"
+      },
+      "ms": 0
+    },
+    {
+      "name": "Buyer self-heal — /run-workflow falls back to defaultWorkflowSkeleton when no YAML saved",
+      "verdict": "fail",
+      "evidence": {
+        "error": "/run-workflow uses defaultWorkflowSkeleton fallback",
+        "stack": "Error: /run-workflow uses defaultWorkflowSkeleton fallback\n    at assertTrue (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:99:20)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:415:7)\n    at check (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:81:28)\n    at <anonymous> (/Users/phamdat/privacy/sui-memory/scripts/smoke-make-it-x-scenarios.ts:402:11)"
+      },
+      "ms": 0
+    }
+  ]
+}

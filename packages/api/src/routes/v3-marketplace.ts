@@ -28,7 +28,6 @@ const VALID_DOMAINS = new Set([
   'marketing', 'finance', 'research', 'engineering', 'generalist', 'other',
 ]);
 const VALID_TIERS = new Set(['basic', 'verified', 'tee_attested']);
-const VALID_KINDS = new Set(['api', 'workflow', 'skill']);
 
 /**
  * Sui-only network gate (single source of truth for this file).
@@ -69,9 +68,6 @@ router.get('/listings', async (req: Request, res: Response) => {
   const offset = Math.max(Number(req.query.offset ?? 0), 0);
   const domain = typeof req.query.domain === 'string' && VALID_DOMAINS.has(req.query.domain) ? req.query.domain : null;
   const tier = typeof req.query.tier === 'string' && VALID_TIERS.has(req.query.tier) ? req.query.tier : null;
-  // PRD-X4 / Day-1 quick win — `?kind=api|workflow|skill` filter. Default
-  // (omitted) returns all kinds for back-compat.
-  const kind = typeof req.query.kind === 'string' && VALID_KINDS.has(req.query.kind) ? req.query.kind : null;
 
   const params: Array<string | number | string[]> = [limit, offset, SUI_CHAINS];
   let where = `WHERE a.published = true AND a.chain = ANY($3::text[])`;
@@ -83,15 +79,10 @@ router.get('/listings', async (req: Request, res: Response) => {
     params.push(tier);
     where += ` AND a.verification_tier = $${params.length}`;
   }
-  if (kind) {
-    params.push(kind);
-    where += ` AND a.kind = $${params.length}`;
-  }
 
   const r = await pool.query(
     `SELECT a.id, a.brain_id, a.slug, a.chain, a.domain, a.short_description,
             a.verification_tier, a.pricing, a.persona, a.created_at,
-            a.kind, a.workflow_walrus_blob_id,
             b.title, b.description, b.tags,
             ae_pub.agent_object_id
        FROM agents a
@@ -120,7 +111,6 @@ router.get('/listings/:slug', async (req: Request, res: Response) => {
   const r = await pool.query(
     `SELECT a.id, a.brain_id, a.slug, a.chain, a.domain, a.short_description,
             a.verification_tier, a.pricing, a.persona, a.created_at,
-            a.kind, a.workflow_walrus_blob_id,
             b.title, b.description, b.tags,
             ae_pub.agent_object_id
        FROM agents a

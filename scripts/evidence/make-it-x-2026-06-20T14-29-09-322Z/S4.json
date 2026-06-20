@@ -1,0 +1,30 @@
+{
+  "id": "S4",
+  "title": "Make-it-usable — buyer/vault namespace + Walrus proxy",
+  "assertions": [
+    {
+      "name": "artifact-vault namespace formatter normalizes wallet to lowercase",
+      "verdict": "pass",
+      "evidence": {
+        "ns_format": "artifact-vault-{lowercased}"
+      },
+      "ms": 0
+    },
+    {
+      "name": "GET /v3/loop/buyer/vault/runs handler is registered + queries correct namespace",
+      "verdict": "pass",
+      "evidence": {
+        "handler": "registered + ns-keyed"
+      },
+      "ms": 0
+    },
+    {
+      "name": "GET /v3/loop/buyer/vault/download/:blob_id refuses blobs not in buyer namespace",
+      "verdict": "pass",
+      "evidence": {
+        "handler": "authorized + Walrus-proxied"
+      },
+      "ms": 2
+    }
+  ]
+}

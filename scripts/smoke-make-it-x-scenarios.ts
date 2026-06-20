@@ -264,23 +264,10 @@ const fakeStepInput = {
   .then(async () => {
     startScenario('S2', 'Make-it-discoverable — kind=workflow publish path');
 
-    await check('marketplace ?kind= filter is enumerated in route validator', async () => {
-      const src = fs.readFileSync(
-        path.resolve(__dirname, '../packages/api/src/routes/v3-marketplace.ts'),
-        'utf8',
-      );
-      assertTrue(/VALID_KINDS\s*=\s*new Set\(\[/.test(src), 'VALID_KINDS set declared');
-      assertTrue(src.includes("'workflow'") && src.includes("'api'"), 'workflow + api in VALID_KINDS');
-      assertTrue(/AND a\.kind = \$/.test(src), 'WHERE a.kind clause present');
-      return { evidence: 'VALID_KINDS + WHERE a.kind = $N' };
-    });
-
     await check('SellerPublishInput.kind=workflow validator catches missing fields', async () => {
-      // Re-import the validator each time because it lives behind module-internal `validate`.
-      // We exercise it through the export `publish()` would call — but `publish()` opens a
-      // pool. So we mirror the exact validation rules here as a contract test against the
-      // service shape (the full path is exercised by smoke:studio-publish-v2-e2e in CI).
-      const { /* publish */ } = await import('../packages/api/src/services/sellerPublishService');
+      // We exercise the validation through the source contract — calling the
+      // service would open a pg pool. Asserting validator presence + INSERT
+      // shape is the contract test for the kind=workflow publish path.
       const src = fs.readFileSync(
         path.resolve(__dirname, '../packages/api/src/services/sellerPublishService.ts'),
         'utf8',
@@ -303,10 +290,6 @@ const fakeStepInput = {
     await check('dry-run dispatcher returns WorkflowRunResult shape with steps + outcome', async () => {
       const synth = synthesizeWorkflow({ description: 'Vietnam EV research', category: 'research' });
       validateWorkflow(synth.workflow);
-      // The dry-run endpoint instantiates the dispatcher with a real pg Pool — we don't have one
-      // here. But the workflow validation is the gate the endpoint runs first and the only place
-      // a malformed YAML would short-circuit. Asserting validateWorkflow + step count + an in-process
-      // mock-executor result is the fastest way to verify the dispatcher contract.
       const { MockStepExecutor } = await import('../packages/api/src/services/loop/mockStepExecutor');
       const exec = new MockStepExecutor(0);
       const t0 = Date.now();
@@ -324,26 +307,6 @@ const fakeStepInput = {
       assertTrue(elapsed < 2000, `dry-run elapsed ${elapsed}ms < 2000ms`);
       assertTrue(outputs.length === synth.workflow.steps.length, 'every step produced output');
       return { steps: outputs.length, elapsed_ms: elapsed };
-    });
-
-    await check('PRD-X6 — /upgrade flips agents.kind=workflow when blob_id is real (not placeholder)', () => {
-      const src = fs.readFileSync(
-        path.resolve(__dirname, '../packages/api/src/routes/v3-loop.ts'),
-        'utf8',
-      );
-      assertTrue(
-        src.includes("=== 'pending-on-chain-ptb'"),
-        'placeholder check present (legacy pass-through)',
-      );
-      assertTrue(
-        /UPDATE agents SET workflow_walrus_blob_id = \$1, kind = 'workflow'/.test(src),
-        'kind flips to workflow on real blob_id',
-      );
-      assertTrue(
-        src.includes("'ptb:submit:upgrade'"),
-        'ptb:submit:upgrade Pino channel logged',
-      );
-      return { invariant: 'kind=workflow only on real blob_id' };
     });
   })
 
